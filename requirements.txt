@@ -1,0 +1,19 @@
+# A股量化交易框架 - Python依赖
+# 安装命令: pip install -r requirements.txt
+
+# ========== 核心数据处理 ==========
+numpy>=1.24
+pandas>=2.0
+
+# ========== 机器学习模型 ==========
+lightgbm>=4.0
+xgboost>=2.0
+torch>=2.0
+
+# ========== 数据源 ==========
+baostock>=0.8      # A股历史日线数据（稳定快速，不依赖V8引擎）
+akshare>=1.10      # A股盘中实时行情（新浪接口）
+
+# ========== 工具库 ==========
+tqdm>=4.60          # 进度条
+pyarrow              # parquet文件读写（pandas后端必需）
