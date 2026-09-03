@@ -810,6 +810,8 @@ def main():
 
     display = top[display_cols].copy()
     display.columns = display_names
+    # 在最前面插入排名列（1,2,3...）
+    display.insert(0, "排名", range(1, len(display) + 1))
     # 收盘价保留2位小数
     display["收盘价"] = display["收盘价"].round(2)
     # 出货置信度保留4位小数

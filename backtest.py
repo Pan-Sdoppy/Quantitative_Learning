@@ -112,7 +112,20 @@ def main():
     # ========== 输出汇总 ==========
     logger.info("\n" + "=" * 70)
     logger.info("回测汇总:")
-    print(summary.to_string(index=False))
+    # 仅打印核心指标列，排除超长的 monthly_returns/weights 字典列（避免终端表格被撑爆显示异常）
+    display_cols = ["sell_mode", "total_return", "annual_return", "sharpe",
+                    "max_drawdown", "win_rate", "profit_loss_ratio",
+                    "avg_return_per_trade", "num_trades"]
+    display_cols = [c for c in display_cols if c in summary.columns]
+    print(summary[display_cols].to_string(index=False))
+
+    # 年度收益汇总（2024/2025/2026），不打印月度收益；月度明细见 results/latest/backtest/monthly_returns.csv
+    for h, res in results.items():
+        yr = res["metrics"].get("yearly_returns", {})
+        if yr:
+            logger.info(f"\n年度收益 ({h}):")
+            yr_df = pd.DataFrame([{"year": y, **v} for y, v in sorted(yr.items())])
+            print(yr_df.to_string(index=False))
     failed = [h for h in HORIZONS if h not in models]
     if failed:
         logger.warning(f"以下模式因模型加载失败被跳过: {failed}")
