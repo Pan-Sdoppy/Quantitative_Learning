@@ -38,8 +38,6 @@ INTRADAY_DATA_CACHE = Path(RAW_DIR) / "_intraday_cache.parquet"
 INTRADAY_MIN_INTERVAL = 15  # 盘中最小更新间隔（分钟）
 
 
-
-
 def _disp_width(s: str) -> int:
     """计算字符串的终端显示宽度（中文字符算2，英文算1）"""
     width = 0
@@ -195,8 +193,8 @@ def compute_distribution_risk(all_data: pd.DataFrame, latest_date) -> pd.DataFra
         low_n = grp["low"].rolling(9).min()
         high_n = grp["high"].rolling(9).max()
         rsv = (grp["close"] - low_n) / (high_n - low_n).replace(0, np.nan) * 100
-        grp["kdj_k"] = rsv.ewm(alpha=1/3, adjust=False).mean()
-        grp["kdj_d"] = grp["kdj_k"].ewm(alpha=1/3, adjust=False).mean()
+        grp["kdj_k"] = rsv.ewm(alpha=1 / 3, adjust=False).mean()
+        grp["kdj_d"] = grp["kdj_k"].ewm(alpha=1 / 3, adjust=False).mean()
         grp["kdj_j"] = 3 * grp["kdj_k"] - 2 * grp["kdj_d"]
 
         # MACD(12,26,9)
@@ -370,7 +368,8 @@ def compute_distribution_risk(all_data: pd.DataFrame, latest_date) -> pd.DataFra
         prev2_open = safe(prev2["open"])
         prev2_close = safe(prev2["close"])
         if (prev2_close > prev2_open  # 第一根阳
-                and abs(safe(prev["close"]) - safe(prev["open"])) / max(safe(prev["high"]) - safe(prev["low"]), 0.01) < 0.3  # 第二根小实体
+                and abs(safe(prev["close"]) - safe(prev["open"])) / max(safe(prev["high"]) - safe(prev["low"]),
+                                                                        0.01) < 0.3  # 第二根小实体
                 and close < open_p and close < safe(prev["close"])  # 第三根阴
                 and pos_score > 0.05):
             shape_score += 0.04
@@ -852,7 +851,8 @@ def main():
         ])
         pct_str = f"{row['latest_pct_chg'] * 100:+.2f}%"
         limit_str = f"  状态:{row['limit_status']}"
-        logger.info(f"  {i}. {row['code']} {row['name']}  收盘价:{row['close']:.2f}  涨跌幅:{pct_str}{limit_str}  {conf_str}")
+        logger.info(
+            f"  {i}. {row['code']} {row['name']}  收盘价:{row['close']:.2f}  涨跌幅:{pct_str}{limit_str}  {conf_str}")
 
     # 市场操作建议（在股票推荐之后给出）
     if market_advice:

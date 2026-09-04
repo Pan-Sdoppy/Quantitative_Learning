@@ -331,7 +331,7 @@ def _print_metrics(mode: str, m: dict, take_profit: float = 0.025, stop_loss: fl
     sl_str = f"止损{stop_loss * 100:.1f}%" if stop_loss else "不止损"
     stop_desc = f"动态{tp_str}+{sl_str}"
     weights = m.get("weights", [0.5, 0.3, 0.2])
-    weight_str = ":".join([f"{w*100:.0f}" for w in weights])
+    weight_str = ":".join([f"{w * 100:.0f}" for w in weights])
     logger.info(
         f"  1天持仓-{mode_desc} 回测结果 (Top3仓位{weight_str}, {stop_desc}, 已扣交易成本{DEFAULT_TRANSACTION_COST * 100:.2f}%/次, 剔除涨停股):")
     logger.info(f"    累计收益率: {m['total_return'] * 100:.2f}%")
