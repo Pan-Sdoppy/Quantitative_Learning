@@ -303,6 +303,16 @@ class MLPModel:
         import torch.nn as nn
         from torch.utils.data import DataLoader, TensorDataset
         import gc
+        import random
+
+        # 固定全部随机种子，保证MLP训练可复现
+        random.seed(42)
+        np.random.seed(42)
+        torch.manual_seed(42)
+        if self.device == "cuda":
+            torch.cuda.manual_seed_all(42)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
 
         # 确保float32，避免float64内存爆炸
         X_train = np.asarray(X_train, dtype=np.float32)
@@ -335,7 +345,9 @@ class MLPModel:
         gc.collect()
         torch.cuda.empty_cache() if self.device == "cuda" else None
         dataset = TensorDataset(X_t, y_t)
-        loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, drop_last=True)
+        _g = torch.Generator()
+        _g.manual_seed(42)
+        loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, drop_last=True, generator=_g)
 
         self.model = self._build_model().to(self.device)
         optimizer = torch.optim.AdamW(self.model.parameters(), lr=lr, weight_decay=1e-4)
