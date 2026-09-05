@@ -8,20 +8,20 @@
 4. 给出1天持仓动态卖出的置信度（保留4位小数）：
       - 1d_close: T日尾盘买，T+1尾盘收盘卖
 5. 按动态卖出置信度优先排序，输出Top股票推荐
-7. 打印本次预测基于的数据时间范围
+6. 打印本次预测基于的数据时间范围
 
 用法：
     python predict.py
 """
 import json
 import warnings
-from datetime import datetime
+from datetime import datetime, time
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
-from core.data_loader import load_all_data
+from core.data_loader import load_all_data, get_stock_list, load_hs300
 from core.factors import compute_factors
 from core.model import EnsembleModel, compute_confidence
 from core.utils import RESULT_DIR, MODEL_DIR, get_logger, RAW_DIR
@@ -35,6 +35,7 @@ HORIZONS = ["1d_close"]
 INTRADAY_CACHE_FILE = Path(RAW_DIR) / "_intraday_last_update.json"
 INTRADAY_DATA_CACHE = Path(RAW_DIR) / "_intraday_cache.parquet"
 INTRADAY_MIN_INTERVAL = 15  # 盘中最小更新间隔（分钟）
+MIN_STOCKS_PER_DAY = 1000  # 最新交易日最少股票数，避免盘中数据不完整
 
 
 def _disp_width(s: str) -> int:
@@ -66,7 +67,7 @@ def _pad_str(s: str, width: int, align: str = "left") -> str:
 
 
 # 数字列（右对齐）和文字列（左对齐）的判断
-NUMERIC_COLS = {"收盘价", "最新涨跌幅", "动态卖出置信度", "动态卖出预测收益"}
+NUMERIC_COLS = {"收盘价", "最新涨跌幅", "动态卖出置信度"}
 TEXT_COLS = {"股票代码", "股票名称", "状态"}
 
 
@@ -76,6 +77,7 @@ def _format_val(col: str, val) -> str:
         return ""
     if col == "收盘价":
         return f"{float(val):.2f}"
+    elif col == "动态卖出置信度":
         return f"{float(val):.4f}"
     else:
         return str(val)
@@ -128,11 +130,269 @@ def print_table(df: pd.DataFrame):
         print("  ".join(row_parts))
 
 
+# ============================================================
+# 盘中实时数据处理
+# ============================================================
+def is_trading_hours(now: datetime) -> bool:
+    """判断当前是否为A股交易时间：周一到周五 9:30-15:00（节假日由数据接口自然处理）"""
+    if now.weekday() >= 5:  # 周六周日
+        return False
+    t = now.time()
+    return time(9, 30) <= t <= time(15, 0)
+
+
+def should_update_intraday(now: datetime) -> bool:
+    """距上次盘中更新是否已超过最小间隔（15分钟）"""
+    if not INTRADAY_CACHE_FILE.exists():
+        return True
+    try:
+        with open(INTRADAY_CACHE_FILE, "r", encoding="utf-8") as f:
+            last = json.load(f).get("last_update")
+        if not last:
+            return True
+        last_dt = datetime.fromisoformat(last)
+        elapsed = (now - last_dt).total_seconds() / 60
+        return elapsed >= INTRADAY_MIN_INTERVAL
+    except Exception:
+        return True
+
+
+def save_intraday_update_time(now: datetime):
+    """记录本次盘中数据更新时间"""
+    try:
+        with open(INTRADAY_CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump({"last_update": now.isoformat()}, f, ensure_ascii=False)
+    except Exception as e:
+        logger.warning(f"盘中更新时间保存失败: {e}")
+
+
+def load_intraday_cache(now: datetime):
+    """加载盘中实时数据缓存（距上次更新不足15分钟时复用）"""
+    if INTRADAY_DATA_CACHE.exists():
+        try:
+            return pd.read_parquet(INTRADAY_DATA_CACHE)
+        except Exception:
+            return None
+    return None
+
+
+def save_intraday_cache(df: pd.DataFrame):
+    """缓存盘中实时数据"""
+    try:
+        df.to_parquet(INTRADAY_DATA_CACHE, index=False)
+    except Exception as e:
+        logger.warning(f"盘中数据缓存失败: {e}")
+
+
+def fetch_intraday_data() -> pd.DataFrame:
+    """用akshare新浪接口获取全市场实时行情，转换为与历史数据一致的格式"""
+    import akshare as ak
+    logger.info("获取盘中实时行情（新浪接口）...")
+    spot = ak.stock_zh_a_spot()
+    # 列名中文映射：代码、名称、最新价、涨跌幅、今开、最高、最低、成交量、成交额、换手率
+    col_map = {}
+    for c in spot.columns:
+        cl = str(c)
+        if "代码" in cl:
+            col_map[c] = "code"
+        elif "最新价" in cl or cl == "最新":
+            col_map[c] = "close"
+        elif "今开" in cl:
+            col_map[c] = "open"
+        elif "最高" in cl:
+            col_map[c] = "high"
+        elif "最低" in cl:
+            col_map[c] = "low"
+        elif "成交量" in cl:
+            col_map[c] = "volume"
+        elif "成交额" in cl:
+            col_map[c] = "amount"
+        elif "换手率" in cl:
+            col_map[c] = "turnover"
+        elif "涨跌幅" in cl:
+            col_map[c] = "pct_chg"
+    spot = spot.rename(columns=col_map)
+    needed = ["code", "open", "high", "low", "close", "volume", "amount", "turnover", "pct_chg"]
+    have = [c for c in needed if c in spot.columns]
+    spot = spot[have].copy()
+    spot["code"] = spot["code"].astype(str).str.extract(r"(\d{6})", expand=False).fillna("").str.zfill(6)
+    # 仅主板
+    spot = spot[spot["code"].str.match(r"^(60|00)")]
+    for c in ["open", "high", "low", "close", "volume", "amount", "turnover", "pct_chg"]:
+        if c in spot.columns:
+            spot[c] = pd.to_numeric(spot[c], errors="coerce")
+    # 剔除无效数据（最新价为空或0）
+    spot = spot[(spot["close"] > 0) & spot["close"].notna()]
+    logger.info(f"盘中实时行情获取完成: {len(spot)} 只主板股票")
+    return spot.reset_index(drop=True)
+
+
+def merge_intraday_data(historical: pd.DataFrame, intraday: pd.DataFrame) -> pd.DataFrame:
+    """将盘中实时数据作为最新一个交易日合并到历史数据（替换当日已有记录）"""
+    now = datetime.now()
+    # 盘中数据以15分钟为间隔向下取整，日期取当天
+    intraday = intraday.copy()
+    intraday["date"] = pd.Timestamp(now.date())
+    # 历史数据中剔除当天已有记录（盘中重复运行时用最新实时数据替换）
+    today = pd.Timestamp(now.date())
+    hist = historical[historical["date"] < today].copy()
+    # 补齐历史有但实时缺失的列
+    for c in hist.columns:
+        if c not in intraday.columns:
+            intraday[c] = np.nan
+    intraday = intraday[hist.columns]
+    merged = pd.concat([hist, intraday], ignore_index=True)
+    merged["code"] = merged["code"].astype("category")
+    return merged.sort_values(["date", "code"]).reset_index(drop=True)
+
+
+def build_market_advice(latest_factor_data: pd.DataFrame) -> str:
+    """根据沪深300相对20日均线的位置给出市场操作建议"""
+    trend_col = "hs300_trend"
+    if trend_col not in latest_factor_data.columns:
+        return ""
+    try:
+        trend = float(latest_factor_data[trend_col].iloc[-1])
+        pct = trend * 100
+        if trend < -0.05:
+            return f"⚠️ 空仓避险：沪深300低于20日均线{pct:.1f}%（极端熊市，建议空仓）"
+        elif trend < -0.02:
+            return f"⚠️ 谨慎操作：沪深300低于20日均线{pct:.1f}%（弱势，降低仓位）"
+        else:
+            return f"✅ 正常持仓：沪深300高于20日均线{pct:.1f}%（可正常买Top3）"
+    except Exception:
+        return ""
+
+
+def main():
+    now = datetime.now()
+    logger.info("=" * 70)
+    logger.info("A股量化预测开始")
+    logger.info(f"当前时间: {now:%Y-%m-%d %H:%M:%S}")
+
+    # ========== Step 1: 判断交易时间，决定数据来源 ==========
+    logger.info("\n" + "=" * 70)
+    use_intraday = is_trading_hours(now)
+    intraday_df = None
+    if use_intraday:
+        if should_update_intraday(now):
+            logger.info("Step 1: 交易时间内，更新盘中实时数据")
+            try:
+                intraday_df = fetch_intraday_data()
+                save_intraday_cache(intraday_df)
+                save_intraday_update_time(now)
+            except Exception as e:
+                logger.warning(f"盘中实时数据获取失败({e})，尝试使用缓存")
+                intraday_df = load_intraday_cache(now)
+                if intraday_df is None:
+                    use_intraday = False
+        else:
+            logger.info("Step 1: 交易时间内，但距上次更新不足15分钟，使用缓存")
+            intraday_df = load_intraday_cache(now)
+            if intraday_df is None:
+                use_intraday = False
+    else:
+        logger.info("Step 1: 非交易时间，使用训练文件的最新存量数据（不更新）")
+
+    # ========== Step 2: 加载数据并计算最新因子 ==========
+    logger.info("\n" + "=" * 70)
+    logger.info("Step 2: 加载数据并计算最新因子")
+    all_data = load_all_data()
+    if use_intraday and intraday_df is not None and not intraday_df.empty:
+        all_data = merge_intraday_data(all_data, intraday_df)
+        logger.info(f"本次预测基于实时数据: {all_data['date'].min():%Y-%m-%d} ~ {all_data['date'].max():%Y-%m-%d}")
+    else:
+        use_intraday = False
+        logger.info(f"本次预测基于存量数据: {all_data['date'].min():%Y-%m-%d} ~ {all_data['date'].max():%Y-%m-%d}")
+
+    factor_data, factor_cols = compute_factors(all_data)
+    del all_data
+    import gc
+    gc.collect()
+
+    # 智能识别最新交易日：股票数量≥1000的最新一天，避免盘中数据不完整
+    day_counts = factor_data.groupby("date")["code"].nunique()
+    valid_days = day_counts[day_counts >= MIN_STOCKS_PER_DAY].index
+    if len(valid_days) == 0:
+        logger.error("没有找到股票数量足够的交易日，预测终止")
+        return
+    latest_date = valid_days.max()
+    latest_data = factor_data[factor_data["date"] == latest_date].copy()
+    logger.info(f"预测基准日: {latest_date:%Y-%m-%d}, 可预测股票数: {len(latest_data)}")
+
+    # 读取预测模型的训练数据范围（checkpoint）
+    cp_path = MODEL_DIR / PREDICT_TAG / "_checkpoint.json"
+    if cp_path.exists():
+        try:
+            with open(cp_path, "r", encoding="utf-8") as f:
+                cp = json.load(f)
+            sig = cp.get("data_signature", "")
+            logger.info(f"预测模型训练数据: 截止{cp.get('train_end_date', '?')}（100%全量数据训练，签名{sig}）")
+        except Exception:
+            pass
+
+    # ========== Step 3: 加载模型并预测 ==========
+    logger.info("\n" + "=" * 70)
+    logger.info("Step 3: 加载模型并预测")
+    models = {}
+    for h in HORIZONS:
+        try:
+            model = EnsembleModel(horizon=h)
+            model.load(tag=PREDICT_TAG)
+            models[h] = model
+        except Exception as e:
+            logger.error(f"模型加载失败 ({h}): {e}")
+    if not models:
+        logger.error("没有可用模型，请先运行 python train.py")
+        return
+
+    available_horizons = list(models.keys())
+    predictions = {}
+    confidences = {}
+    X_latest = latest_data[factor_cols]
+    for h in available_horizons:
+        pred = models[h].predict(X_latest)
+        predictions[h] = pred
+        confidences[h] = compute_confidence(pred)
+        logger.info(f"1天持仓-动态卖出 ({h}) 预测完成，置信度范围: [{confidences[h].min():.4f}, {confidences[h].max():.4f}]")
+
+    # ========== Step 4: 组装预测结果 ==========
+    logger.info("\n" + "=" * 70)
+    logger.info("Step 4: 组装预测结果")
+    result = latest_data[["code", "close"]].copy()
+    result["code"] = result["code"].astype(str).str.zfill(6)
+
+    # 加载股票名称映射
+    try:
+        stock_list = get_stock_list()
+        name_map = dict(zip(stock_list["code"].astype(str).str.zfill(6), stock_list["name"]))
+        result["name"] = result["code"].map(name_map).fillna("")
+        logger.info(f"加载股票名称映射: {len(name_map)} 只")
+    except Exception as e:
+        logger.warning(f"股票名称加载失败({e})，名称留空")
+        result["name"] = ""
+
+    # 最新涨跌幅：优先用ret_1d_raw（原始收益率，未标准化）
+    if "ret_1d_raw" in latest_data.columns:
+        result["latest_pct_chg"] = latest_data["ret_1d_raw"].values
+    else:
+        result["latest_pct_chg"] = 0.0
+
+    # 涨停标记：主板涨停10%，>=9.9%视为涨停（考虑四舍五入）
+    result["is_limit_up"] = result["latest_pct_chg"] >= 0.099
+    result["limit_status"] = result["is_limit_up"].map({True: "涨停", False: "可买入"})
+
     for h in available_horizons:
         result[f"pred_ret_{h}"] = np.round(predictions[h], 6)
         result[f"confidence_{h}"] = confidences[h]
 
+    # 排序：动态卖出置信度降序
+    sort_cols = [f"confidence_{h}" for h in available_horizons]
     result = result.sort_values(sort_cols, ascending=[False] * len(sort_cols)).reset_index(drop=True)
+
+    # 市场操作建议
+    market_advice = build_market_advice(latest_data)
+    data_end = factor_data["date"].max()
 
     # ========== Step 5: 输出Top N ==========
     logger.info("\n" + "=" * 70)
@@ -171,7 +431,7 @@ def print_table(df: pd.DataFrame):
     print(
         f"预测基准日: {latest_date:%Y-%m-%d}  |  数据时间: {data_time_str}  |  策略: {buy_strategy}, 排序优先级: {sort_desc}")
     print("=" * 100)
-    print_table(display)
+    print_table(display.head(4000))  # 终端只打印前50，完整结果存CSV
     print("=" * 100)
 
     # 保存完整预测结果
