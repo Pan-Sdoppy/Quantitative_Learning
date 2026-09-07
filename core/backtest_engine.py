@@ -5,6 +5,7 @@
 - 扣除交易成本（0.35%/次），剔除T日涨停股（尾盘封单买不进）
 - 1d_close模式：动态止盈2%+动态止损-1%（经参数优化最优阈值）
 - 市场择时：沪深300低于20日均线5%以上空仓（极端熊市保护）
+- 当天大阳线过滤（可选）：T日实体涨幅(close-open)/open或日涨幅(ret_1d_raw)超阈值则剔除，避免追高
 - 计算累计收益、年化、夏普、最大回撤、胜率、年度收益
 - 输出回测报告与净值曲线
 """
@@ -28,10 +29,14 @@ def run_backtest(factor_data: pd.DataFrame, models: dict,
                  start_date: str = None, end_date: str = None,
                  transaction_cost: float = DEFAULT_TRANSACTION_COST,
                  take_profit: float = 0.025,
-                 stop_loss: float = -0.05) -> dict:
+                 stop_loss: float = -0.05,
+                 filter_today_body_ret: float = None,
+                 filter_today_day_ret: float = None) -> dict:
     """运行动态卖出回测（1d_close）
     take_profit: 高开止盈阈值（如0.025=高开2.5%开盘卖），None=无止盈
     stop_loss: 止损阈值（如-0.05=跌5%止损），None=不止损
+    filter_today_body_ret: 方案一，T日实体涨幅(close-open)/open超过此阈值则剔除，None=不过滤
+    filter_today_day_ret: 方案二，T日日涨幅(ret_1d_raw)超过此阈值则剔除，None=不过滤
     """
     if horizons is None:
         horizons = ["1d_close"]
@@ -48,8 +53,15 @@ def run_backtest(factor_data: pd.DataFrame, models: dict,
         logger.info(f"{'=' * 60}")
         tp_str = f"，止盈{take_profit * 100:.1f}%" if take_profit else ""
         sl_str = f"，止损{stop_loss * 100:.1f}%" if stop_loss else ""
-        logger.info(f"开始回测: 1天持仓-动态卖出 ({h}){tp_str}{sl_str}, Top{top_n}")
-        res = _backtest_single_mode(factor_data, models[h], h, top_n, transaction_cost, take_profit, stop_loss)
+        filt_str = ""
+        if filter_today_body_ret is not None:
+            filt_str += f"，T日实体涨幅>{filter_today_body_ret * 100:.1f}%剔除"
+        if filter_today_day_ret is not None:
+            filt_str += f"，T日日涨幅>{filter_today_day_ret * 100:.1f}%剔除"
+        logger.info(f"开始回测: 1天持仓-动态卖出 ({h}){tp_str}{sl_str}, Top{top_n}{filt_str}")
+        res = _backtest_single_mode(factor_data, models[h], h, top_n, transaction_cost,
+                                     take_profit, stop_loss,
+                                     filter_today_body_ret, filter_today_day_ret)
         results[h] = res
         _print_metrics(h, res["metrics"], take_profit, stop_loss)
 
@@ -59,10 +71,14 @@ def run_backtest(factor_data: pd.DataFrame, models: dict,
 def _backtest_single_mode(factor_data: pd.DataFrame, model, mode: str, top_n: int,
                           transaction_cost: float = DEFAULT_TRANSACTION_COST,
                           take_profit: float = 0.025,
-                          stop_loss: float = -0.05) -> dict:
+                          stop_loss: float = -0.05,
+                          filter_today_body_ret: float = None,
+                          filter_today_day_ret: float = None) -> dict:
     """单模式回测（1d_close 动态止盈+止损）
     take_profit: 高开止盈阈值（如0.025=高开2.5%开盘卖），None=无止盈
     stop_loss: 止损阈值（如-0.05=跌5%止损），None=不止损
+    filter_today_body_ret: 方案一，T日实体涨幅(close-open)/open超过此阈值则剔除
+    filter_today_day_ret: 方案二，T日日涨幅(ret_1d_raw)超过此阈值则剔除
     """
     feature_cols = [c for c in (model.feature_names or []) if c is not None and c in factor_data.columns]
     if not feature_cols:
@@ -89,6 +105,7 @@ def _backtest_single_mode(factor_data: pd.DataFrame, model, mode: str, top_n: in
     stock_trades = []
     equity_points = []
     skipped_empty = 0
+    skipped_filter = 0
 
     pbar_desc = "回测 动态卖出"
 
@@ -115,6 +132,23 @@ def _backtest_single_mode(factor_data: pd.DataFrame, model, mode: str, top_n: in
             day_data = day_data[day_data["ret_1d_raw"] < LIMIT_UP_THRESHOLD]
             if len(day_data) < before:
                 logger.debug(f"  {rebal_date:%Y-%m-%d}: 剔除{before - len(day_data)}只涨停股")
+
+        # 方案一：剔除T日实体大阳线（(close-open)/open > 阈值），避免追高
+        if filter_today_body_ret is not None:
+            before = len(day_data)
+            body_ret = (day_data["close"] - day_data["open"]) / day_data["open"]
+            day_data = day_data[body_ret < filter_today_body_ret]
+            skipped_filter += before - len(day_data)
+            if len(day_data) < before:
+                logger.debug(f"  {rebal_date:%Y-%m-%d}: 实体大阳线过滤剔除{before - len(day_data)}只")
+
+        # 方案二：剔除T日日涨幅过大（ret_1d_raw > 阈值），避免追高
+        if filter_today_day_ret is not None and "ret_1d_raw" in day_data.columns:
+            before = len(day_data)
+            day_data = day_data[day_data["ret_1d_raw"] < filter_today_day_ret]
+            skipped_filter += before - len(day_data)
+            if len(day_data) < before:
+                logger.debug(f"  {rebal_date:%Y-%m-%d}: 日涨幅过滤剔除{before - len(day_data)}只")
 
         if len(day_data) < top_n:
             continue
@@ -217,6 +251,8 @@ def _backtest_single_mode(factor_data: pd.DataFrame, model, mode: str, top_n: in
 
     if skipped_empty > 0:
         logger.info(f"市场择时空仓次数: {skipped_empty} (大盘低于20日均线5%以上，极端熊市)")
+    if skipped_filter > 0:
+        logger.info(f"当天大阳线过滤累计剔除: {skipped_filter}只候选股")
 
     equity_df = pd.DataFrame(equity_points)
     if equity_df.empty:

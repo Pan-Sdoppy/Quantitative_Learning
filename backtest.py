@@ -7,6 +7,8 @@
       - 1d_close: T日尾盘买，动态卖出（高开2.5%止盈+跌5%止损）
 3. 每次买3只股票，输出累计收益、年化、夏普、最大回撤、胜率、年度收益等指标
 4. 保存交易明细和净值曲线（覆盖保存）
+5. 已启用当天大阳线过滤：T日日涨幅(ret_1d_raw)>7%的股票剔除，避免追高
+   （经9组回测对比，方案二日涨>7%全周期最优：夏普11.59→12.06，2026收益886%→1020%）
 
 用法：
     python backtest.py
@@ -27,12 +29,15 @@ logger = get_logger("backtest")
 BACKTEST_TAG = "latest/backtest"  # 回测自动加载回测模型（训练到2023-12-31）
 TOP_N = 3
 HORIZONS = ["1d_close"]
+# 当天大阳线过滤阈值：T日日涨幅(ret_1d_raw)>7%剔除（避免追高，经9组回测全周期最优）
+FILTER_TODAY_DAY_RET = 0.07
 
 
 def main():
     logger.info("=" * 70)
     logger.info("A股量化策略回测开始")
     logger.info(f"配置: 每次买{TOP_N}只, 1天持仓动态卖出={HORIZONS}, 模型={BACKTEST_TAG}")
+    logger.info(f"当天大阳线过滤: T日日涨幅>{FILTER_TODAY_DAY_RET * 100:.0f}%剔除（避免追高）")
 
     # ========== Step 1: 加载因子数据（基于训练文件的最新数据） ==========
     logger.info("\n" + "=" * 70)
@@ -102,6 +107,7 @@ def main():
         horizons=available_horizons,
         start_date=start_dt,
         end_date=None,
+        filter_today_day_ret=FILTER_TODAY_DAY_RET,  # 当天日涨幅>7%剔除（避免追高）
     )
 
     # ========== Step 4: 保存结果 ==========
