@@ -5,8 +5,8 @@
 1. 增量下载A股全市场数据（自动剔除ST/退市/次新/停牌）
 2. 计算技术因子 + 横截面标准化（缓存复用）
 3. 训练1天持仓动态卖出的 LightGBM + XGBoost + MLP 集成模型
-      - 1d_close: T日尾盘买，T+1尾盘收盘卖
-4. 一次训练产出两套模型：回测模型（训练到2023-12-31）+ 预测模型（100%全量数据）
+      - 1d_close: T日尾盘买，T+1动态卖
+4. 一次训练产出两套模型：回测模型（训练到2023-12-31）、预测模型（100%全量数据）
 5. 模型覆盖保存，不产生垃圾文件
 
 用法：
@@ -92,7 +92,7 @@ def train_models_with_split(labeled, factor_cols, horizons, split_ratio=0.8, sav
     data_signature = f"{len(factor_cols)}f_{train_df['date'].max():%Y%m%d}_{len(train_df)}"
     train_end_date = train_end.strftime("%Y-%m-%d")
 
-    # 每次运行都重新训练，不清空断点文件（保留训练过程中的崩溃恢复能力）
+    # 每次运行都重新训练，不清空断点文件（保留训练过程中的宕机恢复能力）
     cp = load_checkpoint(save_tag)
     trained_horizons = []  # 每次运行都从头训练，不跳过已训练模型
     cp_data_sig = cp.get("data_signature", "")
@@ -131,7 +131,7 @@ def train_models_with_split(labeled, factor_cols, horizons, split_ratio=0.8, sav
 
         except Exception as e:
             logger.error(f"1天持仓-动态卖出 ({h}) 模型训练失败: {e}", exc_info=True)
-            logger.info(f"跳过 {h}，继续训练其他模式")
+            logger.info(f"跳过 {h}，继续训练其他模型")
             continue
 
     return models
@@ -189,7 +189,7 @@ def train_models_full_data(labeled, factor_cols, horizons, save_tag,
 
         except Exception as e:
             logger.error(f"1天持仓-动态卖出 ({h}) 模型训练失败 [预测模型]: {e}", exc_info=True)
-            logger.info(f"跳过 {h}，继续训练其他模式")
+            logger.info(f"跳过 {h}，继续训练其他模型")
             continue
 
     return models
@@ -280,7 +280,7 @@ def main():
                     meta = _json.load(f)
                 if meta:
                     data_latest = max(meta.values())
-            if data_latest and cached_date >= pd.Timestamp(data_latest) - pd.Timedelta(days=1):
+            if data_latest and cached_date >= pd.Timestamp(data_latest):
                 logger.info(f"因子缓存可用（最新日期 {cached_date:%Y-%m-%d}），直接复用")
                 factor_data = cached
                 with open(factor_cols_path, "r", encoding="utf-8") as f:
