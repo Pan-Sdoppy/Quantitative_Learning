@@ -258,7 +258,7 @@ def create_labels(factor_data: pd.DataFrame, horizons: list = None) -> pd.DataFr
     """
     创建标签：T日预测，T日尾盘买入，1天后卖出的收益率。
     动态卖出：
-    -     - 1d_close: 动态卖出——T+1开盘高开≥2.5%则开盘价止盈，开盘低开超5%则开盘价止损，否则持有到T+1尾盘，收盘价跌超5%按-5%止损，否则收盘价卖出
+    -     - 1d_close: 动态卖出——T+1开盘高开≥2%则开盘价止盈，开盘低开≤-2%则开盘价止损，否则持有到T+1尾盘，收盘价跌超2%按-2%止损，否则收盘价卖出
     优化目标=单位时间收益最大化（1天持仓，总收益即日均收益），直接在原数据上修改。
     """
     if horizons is None:
@@ -275,21 +275,21 @@ def create_labels(factor_data: pd.DataFrame, horizons: list = None) -> pd.DataFr
 
     for mode in horizons:
         # 1d_close 动态卖出
-        # 1. 开盘高开≥2.5% → 开盘价止盈
-        # 2. 开盘低开超5% → 开盘价止损（开盘已跌超止损线，按实际开盘价成交）
-        # 3. 否则持有到尾盘，收盘价跌超5%按-5%止损价卖出
+        # 1. 开盘高开≥2% → 开盘价止盈
+        # 2. 开盘低开≤-2% → 开盘价止损（开盘已跌超止损线，按实际开盘价成交）
+        # 3. 否则持有到尾盘，收盘价跌超2%按-2%止损价卖出
         open_gap = open_d1 / buy_price - 1
-        take_profit_mask = open_gap >= 0.025
-        open_stop_loss_mask = open_gap <= -0.05
+        take_profit_mask = open_gap >= 0.02  # 高开≥2%开盘止盈
+        open_stop_loss_mask = open_gap <= -0.02  # 低开≤-2%开盘止损
         # 默认尾盘收盘价卖出
         sell_price = close_d1.copy()
-        # 高开2.5%以上则开盘价止盈卖出
+        # 高开2%以上则开盘价止盈卖出
         sell_price[take_profit_mask] = open_d1[take_profit_mask]
-        # 开盘跌超5%则开盘价止损卖出（按实际开盘价，不是止损价）
+        # 开盘跌超2%则开盘价止损卖出（按实际开盘价，不是止损价）
         sell_price[open_stop_loss_mask] = open_d1[open_stop_loss_mask]
-        # 尾盘动态止损：收盘价跌超5%，按-5%止损价卖出（模拟止损单到价即成交）
-        close_stop_loss_mask = (~take_profit_mask) & (~open_stop_loss_mask) & (close_d1 / buy_price - 1 <= -0.05)
-        sell_price[close_stop_loss_mask] = buy_price[close_stop_loss_mask] * 0.95
+        # 尾盘动态止损：收盘价跌超2%，按-2%止损价卖出（模拟止损单到价即成交）
+        close_stop_loss_mask = (~take_profit_mask) & (~open_stop_loss_mask) & (close_d1 / buy_price - 1 <= -0.02)
+        sell_price[close_stop_loss_mask] = buy_price[close_stop_loss_mask] * 0.98  # -2%止损价
         total_ret = sell_price / buy_price - 1
         # 1天持仓，总收益即日均收益，无需除以天数
         df[f"label_ret_{mode}"] = total_ret.astype("float32")

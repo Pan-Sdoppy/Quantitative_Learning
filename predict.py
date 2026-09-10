@@ -21,7 +21,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from core.data_loader import load_all_data, get_stock_list, load_hs300
+from core.data_loader import load_all_data, get_stock_list
 from core.factors import compute_factors
 from core.model import EnsembleModel, compute_confidence
 from core.utils import RESULT_DIR, MODEL_DIR, get_logger, RAW_DIR
@@ -34,7 +34,7 @@ TOP_N = 5000
 HORIZONS = ["1d_close"]
 INTRADAY_CACHE_FILE = Path(RAW_DIR) / "_intraday_last_update.json"
 INTRADAY_DATA_CACHE = Path(RAW_DIR) / "_intraday_cache.parquet"
-INTRADAY_MIN_INTERVAL = 15  # 盘中最小更新间隔（分钟）
+INTRADAY_MIN_INTERVAL = 0  # 盘中每次运行都获取最新实时数据，不缓存（0=不节流）
 MIN_STOCKS_PER_DAY = 1000  # 最新交易日最少股票数，避免盘中数据不完整
 
 
@@ -354,7 +354,8 @@ def main():
         pred = models[h].predict(X_latest)
         predictions[h] = pred
         confidences[h] = compute_confidence(pred)
-        logger.info(f"1天持仓-动态卖出 ({h}) 预测完成，置信度范围: [{confidences[h].min():.4f}, {confidences[h].max():.4f}]")
+        logger.info(
+            f"1天持仓-动态卖出 ({h}) 预测完成，置信度范围: [{confidences[h].min():.4f}, {confidences[h].max():.4f}]")
 
     # ========== Step 4: 组装预测结果 ==========
     logger.info("\n" + "=" * 70)
@@ -424,8 +425,7 @@ def main():
     print("\n" + "=" * 100)
     buy_strategy = "今日尾盘买入" if use_intraday else "下一交易日尾盘买入"
     if use_intraday:
-        minute_floor = (now.minute // 15) * 15
-        data_time_str = f"{now:%Y-%m-%d} {now.hour:02d}:{minute_floor:02d}"
+        data_time_str = f"{now:%Y-%m-%d %H:%M}（实时快照）"
     else:
         data_time_str = f"{data_end:%Y-%m-%d}（收盘）"
     print(

@@ -1,9 +1,9 @@
 """
 回测引擎（1天持仓策略，动态卖出）：
-- 1d_close: T日预测选股，T日尾盘买入，动态卖出——高开≥2%开盘止盈，否则尾盘收盘价卖出（跌超1%按-1%止损）
+- 1d_close: T日预测选股，T日尾盘买入，动态卖出——高开≥2%开盘止盈，低开≤-2%开盘止损，否则尾盘收盘价卖出（跌超2%按-2%止损）
 - 每个交易日调仓，置信度加权Top3（Top1 50%, Top2 30%, Top3 20%）
 - 扣除交易成本（0.35%/次），剔除T日涨停股（尾盘封单买不进）
-- 1d_close模式：动态止盈2%+动态止损-1%（经参数优化最优阈值）
+- 1d_close模式：动态止盈2%+动态止损-2%（经参数优化最优阈值）
 - 市场择时：沪深300低于20日均线5%以上空仓（极端熊市保护）
 - 当天大阳线过滤（可选）：T日实体涨幅(close-open)/open或日涨幅(ret_1d_raw)超阈值则剔除，避免追高
 - 计算累计收益、年化、夏普、最大回撤、胜率、年度收益
@@ -28,15 +28,17 @@ def run_backtest(factor_data: pd.DataFrame, models: dict,
                  top_n: int = 3, horizons: list = None,
                  start_date: str = None, end_date: str = None,
                  transaction_cost: float = DEFAULT_TRANSACTION_COST,
-                 take_profit: float = 0.025,
-                 stop_loss: float = -0.05,
+                 take_profit: float = 0.02,
+                 stop_loss: float = -0.02,
                  filter_today_body_ret: float = None,
-                 filter_today_day_ret: float = None) -> dict:
+                 filter_today_day_ret: float = None,
+                 weights: list = None) -> dict:
     """运行动态卖出回测（1d_close）
-    take_profit: 高开止盈阈值（如0.025=高开2.5%开盘卖），None=无止盈
-    stop_loss: 止损阈值（如-0.05=跌5%止损），None=不止损
+    take_profit: 高开止盈阈值（如0.02=高开2%开盘卖），None=无止盈
+    stop_loss: 止损阈值（如-0.02=跌2%止损），None=不止损
     filter_today_body_ret: 方案一，T日实体涨幅(close-open)/open超过此阈值则剔除，None=不过滤
     filter_today_day_ret: 方案二，T日日涨幅(ret_1d_raw)超过此阈值则剔除，None=不过滤
+    weights: TopN仓位权重列表（如[0.5,0.3,0.2]），None=用默认（Top3全仓Top1）
     """
     if horizons is None:
         horizons = ["1d_close"]
@@ -60,8 +62,9 @@ def run_backtest(factor_data: pd.DataFrame, models: dict,
             filt_str += f"，T日日涨幅>{filter_today_day_ret * 100:.1f}%剔除"
         logger.info(f"开始回测: 1天持仓-动态卖出 ({h}){tp_str}{sl_str}, Top{top_n}{filt_str}")
         res = _backtest_single_mode(factor_data, models[h], h, top_n, transaction_cost,
-                                     take_profit, stop_loss,
-                                     filter_today_body_ret, filter_today_day_ret)
+                                    take_profit, stop_loss,
+                                    filter_today_body_ret, filter_today_day_ret,
+                                    weights)
         results[h] = res
         _print_metrics(h, res["metrics"], take_profit, stop_loss)
 
@@ -70,15 +73,17 @@ def run_backtest(factor_data: pd.DataFrame, models: dict,
 
 def _backtest_single_mode(factor_data: pd.DataFrame, model, mode: str, top_n: int,
                           transaction_cost: float = DEFAULT_TRANSACTION_COST,
-                          take_profit: float = 0.025,
-                          stop_loss: float = -0.05,
+                          take_profit: float = 0.02,
+                          stop_loss: float = -0.02,
                           filter_today_body_ret: float = None,
-                          filter_today_day_ret: float = None) -> dict:
+                          filter_today_day_ret: float = None,
+                          weights: list = None) -> dict:
     """单模式回测（1d_close 动态止盈+止损）
-    take_profit: 高开止盈阈值（如0.025=高开2.5%开盘卖），None=无止盈
-    stop_loss: 止损阈值（如-0.05=跌5%止损），None=不止损
+    take_profit: 高开止盈阈值（如0.02=高开2%开盘卖），None=无止盈
+    stop_loss: 止损阈值（如-0.02=跌2%止损），None=不止损
     filter_today_body_ret: 方案一，T日实体涨幅(close-open)/open超过此阈值则剔除
     filter_today_day_ret: 方案二，T日日涨幅(ret_1d_raw)超过此阈值则剔除
+    weights: TopN仓位权重列表（如[0.5,0.3,0.2]），None=用默认（Top3全仓Top1）
     """
     feature_cols = [c for c in (model.feature_names or []) if c is not None and c in factor_data.columns]
     if not feature_cols:
@@ -153,12 +158,14 @@ def _backtest_single_mode(factor_data: pd.DataFrame, model, mode: str, top_n: in
         if len(day_data) < top_n:
             continue
 
-        # 选TopN，按置信度加权（Top1 100%, Top2 0%, Top3 0%，只买置信度最高的股票，收益最大化）
+        # 选TopN，按置信度加权（Top1 60%, Top2 40%, Top3 0%，只买Top1+Top2）
         selected = day_data.nlargest(top_n, "pred")
         selected_codes = selected["code"].tolist()
         selected_preds = selected["pred"].tolist()
-        if top_n == 3:
-            weights = [1.0, 0.0, 0.0]
+        if weights is not None:
+            weights = list(weights)[:top_n] + [0.0] * max(0, top_n - len(weights))
+        elif top_n == 3:
+            weights = [0.6, 0.4, 0.0]
         elif top_n == 2:
             weights = [0.6, 0.4]
         else:
@@ -178,9 +185,9 @@ def _backtest_single_mode(factor_data: pd.DataFrame, model, mode: str, top_n: in
 
             # 动态卖出：动态止盈+止损
             # 动态卖出：开盘同时检查止盈和止损
-            # 1. 开盘高开≥2.5% → 开盘价止盈
-            # 2. 开盘低开超5% → 开盘价止损（开盘已跌超止损线，只能按开盘价成交）
-            # 3. 否则持有到尾盘，收盘价跌超5%按-5%止损价卖出
+            # 1. 开盘高开≥2% → 开盘价止盈
+            # 2. 开盘低开≤-2% → 开盘价止损（开盘已跌超止损线，只能按开盘价成交）
+            # 3. 否则持有到尾盘，收盘价跌超2%按-2%止损价卖出
             open_d1 = row["_open_d1"]
             close_d1 = row["_close_d1"]
             if pd.isna(close_d1):
@@ -261,7 +268,7 @@ def _backtest_single_mode(factor_data: pd.DataFrame, model, mode: str, top_n: in
 
     metrics = _calc_metrics(equity_df, trades)
     # 添加仓位比例信息
-    metrics["weights"] = weights if top_n == 3 else [1.0 / top_n] * top_n
+    metrics["weights"] = weights
     trades_df = pd.DataFrame(trades)
     stock_trades_df = pd.DataFrame(stock_trades)
 
@@ -361,7 +368,7 @@ def _calc_metrics(equity_df: pd.DataFrame, trades: list) -> dict:
     }
 
 
-def _print_metrics(mode: str, m: dict, take_profit: float = 0.025, stop_loss: float = -0.05):
+def _print_metrics(mode: str, m: dict, take_profit: float = 0.02, stop_loss: float = -0.02):
     mode_desc = "T日尾盘买/T+1动态卖"
     tp_str = f"止盈{take_profit * 100:.1f}%" if take_profit else "无止盈"
     sl_str = f"止损{stop_loss * 100:.1f}%" if stop_loss else "不止损"

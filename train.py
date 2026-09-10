@@ -307,7 +307,7 @@ def main():
 
     # ========== Step 3: 创建标签 ==========
     logger.info("\n" + "=" * 70)
-    logger.info("Step 3: 创建标签 (1天持仓，动态卖出（高开2.5%止盈+跌5%止损）)")
+    logger.info("Step 3: 创建标签 (1天持仓，动态卖出（高开2%止盈+跌2%止损）)")
     labeled = create_labels(factor_data, horizons=HORIZONS_DEFAULT)
 
     # ========== Step 4: 训练两套模型（回测用 + 预测用） ==========
