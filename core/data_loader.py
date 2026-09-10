@@ -102,13 +102,25 @@ def _build_meta_from_files() -> dict:
 
 
 # ========== 股票列表 ==========
+def _filter_main_board_non_st(df: pd.DataFrame) -> pd.DataFrame:
+    """股票列表统一过滤：仅沪深主板(60/00)、剔除ST/*ST/退市。
+    无论列表来自在线API还是本地缓存都必须过一遍，防止含ST的脏缓存被直接返回、混入下载与训练"""
+    df = df.copy()
+    df["code"] = df["code"].astype(str).str.zfill(6)
+    st_mask = df["name"].astype(str).str.contains("ST|退", case=False, na=False)
+    df = df[~st_mask]  # 剔除ST/*ST/退市
+    df = df[df["code"].str.match(r"^(60|00)")]  # 仅主板，剔除创业板30/科创板68/北交所
+    return df.reset_index(drop=True)
+
+
 def get_stock_list(refresh: bool = False) -> pd.DataFrame:
     """获取A股全市场股票列表，剔除ST/退市，缓存到 _stock_list.csv（缓存7天）"""
     import socket
     cache_path = RAW_DIR / "_stock_list.csv"
     if cache_path.exists() and not refresh:
         df = pd.read_csv(cache_path, dtype={"code": str})
-        logger.info(f"从缓存加载股票列表，共 {len(df)} 只")
+        df = _filter_main_board_non_st(df)  # 缓存也强制剔ST/非主板，杜绝含ST脏缓存直接返回
+        logger.info(f"从缓存加载股票列表(已剔ST/非主板)，共 {len(df)} 只")
         return df
 
     import akshare as ak
@@ -120,7 +132,8 @@ def get_stock_list(refresh: bool = False) -> pd.DataFrame:
         logger.warning(f"股票列表API失败({e})，尝试使用过期缓存")
         if cache_path.exists():
             df = pd.read_csv(cache_path, dtype={"code": str})
-            logger.info(f"回退到缓存股票列表，共 {len(df)} 只")
+            df = _filter_main_board_non_st(df)
+            logger.info(f"回退到缓存股票列表(已剔ST/非主板)，共 {len(df)} 只")
             return df
         raise
     finally:
@@ -137,11 +150,7 @@ def get_stock_list(refresh: bool = False) -> pd.DataFrame:
                 df = df.rename(columns={col: "name"})
                 break
 
-    df["code"] = df["code"].astype(str).str.zfill(6)
-    st_mask = df["name"].str.contains("ST|退", case=False, na=False)
-    df = df[~st_mask].reset_index(drop=True)
-    # 仅主板：60(沪市主板)/00(深市主板)，剔除创业板(30)/科创板(68)/北交所(8/4)
-    df = df[df["code"].str.match(r"^(60|00)")].reset_index(drop=True)
+    df = _filter_main_board_non_st(df)  # 统一剔ST/退市、仅保留沪深主板
 
     df.to_csv(cache_path, index=False, encoding="utf-8-sig")
     logger.info(f"股票列表获取完成，剔除ST后退市后共 {len(df)} 只，已缓存")
