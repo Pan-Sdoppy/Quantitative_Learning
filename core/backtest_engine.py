@@ -28,8 +28,8 @@ def run_backtest(factor_data: pd.DataFrame, models: dict,
                  top_n: int = 3, horizons: list = None,
                  start_date: str = None, end_date: str = None,
                  transaction_cost: float = DEFAULT_TRANSACTION_COST,
-                 take_profit: float = 0.02,
-                 stop_loss: float = -0.02,
+                 take_profit: float = 0.015,
+                 stop_loss: float = -0.025,
                  filter_today_body_ret: float = None,
                  filter_today_day_ret: float = None,
                  weights: list = None) -> dict:
@@ -94,12 +94,13 @@ def _backtest_single_mode(factor_data: pd.DataFrame, model, mode: str, top_n: in
     rebalance_dates = all_dates
     date_to_idx = {d: i for i, d in enumerate(all_dates)}
 
-    # 预计算T+1开盘价和收盘价
+    # 预计算T+1开盘价、收盘价和最低价
     logger.info("预计算T+1价格矩阵（T日尾盘买入）...")
     factor_data = factor_data.sort_values(["code", "date"]).reset_index(drop=True)
     g = factor_data.groupby("code", sort=False)
     factor_data["_open_d1"] = g["open"].shift(-1)
     factor_data["_close_d1"] = g["close"].shift(-1)
+    factor_data["_low_d1"] = g["low"].shift(-1)
 
     # 市场择时：沪深300低于20日均线5%以上空仓（仅极端熊市）
     MARKET_TIMING_EMPTY = -0.05
@@ -184,12 +185,14 @@ def _backtest_single_mode(factor_data: pd.DataFrame, model, mode: str, top_n: in
             is_stop_loss = False
 
             # 动态卖出：动态止盈+止损
-            # 动态卖出：开盘同时检查止盈和止损
             # 1. 开盘高开≥2% → 开盘价止盈
-            # 2. 开盘低开≤-2% → 开盘价止损（开盘已跌超止损线，只能按开盘价成交）
-            # 3. 否则持有到尾盘，收盘价跌超2%按-2%止损价卖出
+            # 2. 开盘低开≤-2% → 开盘价止损（开盘已跌超止损线，只能按实际开盘价成交）
+            # 3. 盘中最低价跌破-2%止损线 → 按止损价成交（即使尾盘拉回止损线以上，
+            #    实盘止损单在盘中触及-2%时已触发成交，回测必须按止损价计，不能按收盘价高估收益）
+            # 4. 否则 → 收盘价卖出
             open_d1 = row["_open_d1"]
             close_d1 = row["_close_d1"]
+            low_d1 = row.get("_low_d1", np.nan)
             if pd.isna(close_d1):
                 continue
             sell_price = None
@@ -203,13 +206,23 @@ def _backtest_single_mode(factor_data: pd.DataFrame, model, mode: str, top_n: in
                     # 开盘已跌超止损阈值，开盘价止损卖出（只能按实际开盘价成交）
                     sell_price = open_d1
                     is_stop_loss = True
-            if sell_price is None:
-                # 未触发开盘止盈/止损，持有到尾盘
-                cum_ret = close_d1 / buy_price - 1
-                if stop_loss and cum_ret <= stop_loss:
-                    # 收盘价跌超止损阈值，按止损价成交（模拟实际止损单到价即成交）
+            if sell_price is None and stop_loss and not pd.isna(low_d1):
+                # 盘中最低价跌破止损线 → 按止损价成交（即使尾盘收回止损线以上）
+                low_ret = low_d1 / buy_price - 1
+                if low_ret <= stop_loss:
                     sell_price = buy_price * (1 + stop_loss)
                     is_stop_loss = True
+            if sell_price is None:
+                # 兜底逻辑：
+                # - low数据缺失(NaN)时回退旧逻辑：收盘价跌超止损线按止损价成交
+                # - low有效且未破止损线：盘中最低价都没破，收盘价必高于止损线，按收盘价卖出
+                if stop_loss and not pd.isna(close_d1):
+                    cum_ret = close_d1 / buy_price - 1
+                    if cum_ret <= stop_loss:
+                        sell_price = buy_price * (1 + stop_loss)
+                        is_stop_loss = True
+                    else:
+                        sell_price = close_d1
                 else:
                     sell_price = close_d1
 

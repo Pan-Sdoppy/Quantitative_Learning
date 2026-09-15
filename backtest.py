@@ -13,6 +13,7 @@
 用法：
     python backtest.py
 """
+import os
 import warnings
 
 import pandas as pd
@@ -56,6 +57,30 @@ def main():
         all_data = load_all_data()
         factor_data, _ = compute_factors(all_data)
         factor_data.to_parquet(factor_path, index=False)
+
+    # 兼容旧因子缓存：若缺少low列（盘中最低价止损需要），从raw数据补齐
+    if "low" not in factor_data.columns:
+        logger.info("因子缓存缺少low列，从raw数据补齐（盘中最低价止损需要）...")
+        import glob as _glob
+        raw_dir = r"C:\Users\Pan\Documents\GitHub\Quantitative_Learning\data\raw"
+        low_parts = []
+        for fp in _glob.glob(raw_dir + "\\*.parquet"):
+            try:
+                fname = os.path.basename(fp).replace(".parquet", "")
+                if not fname.isdigit():
+                    continue  # 跳过 _meta.json 等元数据文件
+                sub = pd.read_parquet(fp, columns=["date", "low"])
+                sub["code"] = fname  # raw按股票存文件，文件名为代码，无code列
+                low_parts.append(sub)
+            except Exception:
+                continue
+        low_df = pd.concat(low_parts, ignore_index=True) if low_parts else pd.DataFrame(columns=["date", "code", "low"])
+        low_df["date"] = pd.to_datetime(low_df["date"])
+        factor_data["date"] = pd.to_datetime(factor_data["date"])
+        factor_data = factor_data.merge(low_df, on=["date", "code"], how="left")
+        del low_parts, low_df
+        import gc; gc.collect()
+        logger.info(f"low列补齐完成，缺失: {int(factor_data['low'].isna().sum())} 行")
 
     logger.info(f"因子数据: {len(factor_data)} 行, {factor_data['code'].nunique()} 只股票")
     logger.info(f"因子数据范围: {factor_data['date'].min():%Y-%m-%d} ~ {factor_data['date'].max():%Y-%m-%d}")
