@@ -380,7 +380,7 @@ def main():
         result["latest_pct_chg"] = 0.0
 
     # 涨停标记：主板涨停10%，>=9.9%视为涨停（考虑四舍五入）
-    result["is_limit_up"] = result["latest_pct_chg"] >= 0.099
+    result["is_limit_up"] = result["latest_pct_chg"] >= 0.095
     result["limit_status"] = result["is_limit_up"].map({True: "涨停", False: "可买入"})
 
     for h in available_horizons:
