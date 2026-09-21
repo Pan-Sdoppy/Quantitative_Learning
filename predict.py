@@ -21,7 +21,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from core.data_loader import load_all_data, get_stock_list
+from core.data_loader import load_all_data, get_stock_list, get_stock_industry
 from core.factors import compute_factors
 from core.model import EnsembleModel, compute_confidence
 from core.utils import RESULT_DIR, MODEL_DIR, get_logger, RAW_DIR
@@ -67,8 +67,8 @@ def _pad_str(s: str, width: int, align: str = "left") -> str:
 
 
 # 数字列（右对齐）和文字列（左对齐）的判断
-NUMERIC_COLS = {"收盘价", "最新涨跌幅", "动态卖出置信度"}
-TEXT_COLS = {"股票代码", "股票名称", "状态"}
+NUMERIC_COLS = {"收盘价", "最新涨跌幅"}
+TEXT_COLS = {"股票代码", "股票名称", "状态", "所属板块"}
 
 
 def _format_val(col: str, val) -> str:
@@ -373,6 +373,16 @@ def main():
         logger.warning(f"股票名称加载失败({e})，名称留空")
         result["name"] = ""
 
+    # 加载股票行业（板块）映射
+    try:
+        industry_df = get_stock_industry()
+        industry_map = dict(zip(industry_df["code"].astype(str).str.zfill(6), industry_df["industry"]))
+        result["industry"] = result["code"].map(industry_map).fillna("")
+        logger.info(f"加载股票行业映射: {len(industry_map)} 只")
+    except Exception as e:
+        logger.warning(f"股票行业加载失败({e})，板块留空")
+        result["industry"] = ""
+
     # 最新涨跌幅：优先用ret_1d_raw（原始收益率，未标准化）
     if "ret_1d_raw" in latest_data.columns:
         result["latest_pct_chg"] = latest_data["ret_1d_raw"].values
@@ -405,10 +415,9 @@ def main():
 
     display_cols = ["code", "name", "close", "latest_pct_chg", "limit_status"]
     display_names = ["股票代码", "股票名称", "收盘价", "最新涨跌幅", "状态"]
-    for h in available_horizons:
-        display_cols.extend([f"confidence_{h}"])
-        mode_name = "动态卖出置信度"
-        display_names.extend([mode_name])
+    # 所属板块放最后一列（排序仍按动态卖出置信度，仅不显示该列）
+    display_cols.append("industry")
+    display_names.append("所属板块")
 
     display = top[display_cols].copy()
     display.columns = display_names
@@ -434,11 +443,41 @@ def main():
     print_table(display.head(4000))  # 终端只打印前50，完整结果存CSV
     print("=" * 100)
 
-    # 保存完整预测结果
-    out_path = RESULT_DIR / PREDICT_TAG / f"prediction_{latest_date:%Y%m%d}.csv"
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    result.to_csv(out_path, index=False, encoding="utf-8-sig")
-    logger.info(f"完整预测结果已保存: {out_path}")
+    # 保存完整预测结果到Excel（单文件多sheet，每天一个sheet，同日重跑覆盖旧数据）
+    from openpyxl.styles import Font
+    from openpyxl.utils import get_column_letter
+    excel_path = RESULT_DIR / PREDICT_TAG / "predictions.xlsx"
+    excel_path.parent.mkdir(parents=True, exist_ok=True)
+    sheet_name = latest_date.strftime("%Y-%m-%d")
+
+    # Excel导出列：排名放第一列，剔除 latest_pct_chg/is_limit_up/pred_ret_1d_close
+    excel_cols = ["code", "name", "close", "limit_status", "industry",
+                  f"confidence_{available_horizons[0]}"]
+    excel_df = result[excel_cols].copy()
+    excel_df.insert(0, "排名", range(1, len(excel_df) + 1))
+    excel_df.columns = ["排名", "股票代码", "股票名称", "收盘价", "状态", "所属板块", "动态卖出置信度"]
+    excel_df["收盘价"] = excel_df["收盘价"].round(2)
+
+    file_exists = excel_path.exists()
+    excel_mode = "a" if file_exists else "w"
+    with pd.ExcelWriter(excel_path, engine="openpyxl", mode=excel_mode,
+                        if_sheet_exists="replace" if file_exists else None) as writer:
+        excel_df.to_excel(writer, sheet_name=sheet_name, index=False)
+        ws = writer.sheets[sheet_name]
+        for row in ws.iter_rows():
+            for cell in row:
+                cell.font = Font(name="微软雅黑", size=11)
+        # 列宽自适应
+        for col_idx, col in enumerate(ws.columns, 1):
+            max_len = 0
+            for cell in col:
+                if cell.value is not None:
+                    v = str(cell.value)
+                    w = sum(2 if ord(ch) > 127 else 1 for ch in v)
+                    if w > max_len:
+                        max_len = w
+            ws.column_dimensions[get_column_letter(col_idx)].width = max_len + 2
+    logger.info(f"预测结果已保存: {excel_path} [sheet={sheet_name}, {len(excel_df)}行]")
 
     # 推荐买入Top3
     logger.info("\n" + "=" * 70)

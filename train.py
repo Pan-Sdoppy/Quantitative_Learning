@@ -12,8 +12,10 @@
 用法：
     python train.py           # 用本地存量数据训练
     python train.py --update  # 先增量下载截止当前最新交易日的数据，再训练
+    python train.py --skip-backtest  # 只训练预测模型，跳过回测模型（回测模型固定2016~2023，无需每次重训）
 """
 import argparse
+import sys
 import json
 import warnings
 from datetime import datetime
@@ -42,6 +44,8 @@ def parse_args():
     parser = argparse.ArgumentParser(description="A股量化模型训练")
     parser.add_argument("--update", action="store_true",
                         help="先增量下载截止当前最新交易日的数据，再训练")
+    parser.add_argument("--skip-backtest", action="store_true",
+                        help="跳过回测模型训练（回测模型固定2016~2023，无需每次重训），只训练预测模型")
     return parser.parse_args()
 
 
@@ -233,7 +237,7 @@ def main():
     args = parse_args()
     logger.info("=" * 70)
     logger.info("A股量化模型训练开始")
-    logger.info(f"参数: update={args.update}, start={START_DATE}, horizons={HORIZONS_DEFAULT}")
+    logger.info(f"参数: update={args.update}, skip_backtest={args.skip_backtest}, start={START_DATE}, horizons={HORIZONS_DEFAULT}")
 
     # GPU检测
     gpu_info = detect_gpu()
@@ -248,6 +252,15 @@ def main():
         try:
             stats = update_data(start_date=START_DATE, force_full=False, is_intraday=False)
             logger.info(f"数据更新统计: {stats}")
+            # 数据完整性校验：失败股票数>5则终止训练，防止脏数据污染模型
+            FAILED_THRESHOLD = 5
+            n_failed = stats.get("failed", 0)
+            if n_failed > FAILED_THRESHOLD:
+                logger.error("=" * 70)
+                logger.error(f"数据完整性校验失败：本次增量更新有 {n_failed} 只股票下载失败，超过阈值 {FAILED_THRESHOLD} 只。")
+                logger.error("为保证训练数据唯一准确性，终止本次训练。请重新运行 python train.py --update 补齐失败股票后再训练。")
+                logger.error("=" * 70)
+                sys.exit(1)
             try:
                 update_hs300()
             except Exception as e:
@@ -313,12 +326,24 @@ def main():
     # ========== Step 4: 训练两套模型（回测用 + 预测用） ==========
     logger.info("\n" + "=" * 70)
     logger.info("Step 4: 训练集成模型 (LightGBM + XGBoost + MLP)")
-    logger.info("  4a. 回测模型 (训练到2023-12-31，回测从2024-01-01开始)")
-    bt_models = train_models_with_split(
-        labeled, factor_cols, HORIZONS_DEFAULT,
-        split_date="2023-12-31", save_tag=BACKTEST_TAG,
-        mode_name="回测模型", retrain=False
-    )
+    if args.skip_backtest:
+        logger.info("  4a. 跳过回测模型训练（--skip-backtest），从已有回测模型加载迭代次数")
+        bt_models = {}
+        for h in HORIZONS_DEFAULT:
+            try:
+                m = EnsembleModel(horizon=h)
+                m.load(tag=BACKTEST_TAG)
+                bt_models[h] = m
+                logger.info(f"    已加载回测模型 ({h})")
+            except Exception as e:
+                logger.warning(f"    加载回测模型失败 ({h}): {e}，将使用默认迭代次数")
+    else:
+        logger.info("  4a. 回测模型 (训练到2023-12-31，回测从2024-01-01开始)")
+        bt_models = train_models_with_split(
+            labeled, factor_cols, HORIZONS_DEFAULT,
+            split_date="2023-12-31", save_tag=BACKTEST_TAG,
+            mode_name="回测模型", retrain=False
+        )
 
     logger.info("\n  4b. 预测模型 (100%全量数据训练，迭代次数从回测模型继承，用于实盘选股)")
     best_iters = extract_best_iters(bt_models, HORIZONS_DEFAULT)
@@ -332,7 +357,10 @@ def main():
     logger.info("\n" + "=" * 70)
     bt_success = [h for h in HORIZONS_DEFAULT if h in bt_models]
     pred_success = [h for h in HORIZONS_DEFAULT if h in pred_models]
-    logger.info(f"训练完成！回测模型成功: {bt_success}, 预测模型成功: {pred_success}")
+    if args.skip_backtest:
+        logger.info(f"训练完成！（跳过回测训练）回测模型已加载: {bt_success}, 预测模型成功: {pred_success}")
+    else:
+        logger.info(f"训练完成！回测模型成功: {bt_success}, 预测模型成功: {pred_success}")
     logger.info(f"回测模型路径: {MODEL_DIR / BACKTEST_TAG}")
     logger.info(f"预测模型路径: {MODEL_DIR / PREDICT_TAG}")
     if bt_success:

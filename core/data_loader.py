@@ -157,6 +157,48 @@ def get_stock_list(refresh: bool = False) -> pd.DataFrame:
     return df
 
 
+def get_stock_industry(refresh: bool = False) -> pd.DataFrame:
+    """获取A股股票行业分类（baostock），缓存到 _stock_industry.csv（缓存30天）
+    返回列: code(6位), name, industry(行业名称)
+    """
+    cache_path = RAW_DIR / "_stock_industry.csv"
+    if cache_path.exists() and not refresh:
+        df = pd.read_csv(cache_path, dtype={"code": str})
+        logger.info(f"从缓存加载股票行业分类，共 {len(df)} 只")
+        return df
+
+    import baostock as bs
+    logger.info("正在获取A股股票行业分类（baostock）...")
+    lg = bs.login()
+    if lg.error_code != "0":
+        logger.warning(f"baostock登录失败: {lg.error_msg}，返回空行业表")
+        return pd.DataFrame(columns=["code", "name", "industry"])
+    try:
+        rs = bs.query_stock_industry()
+        data_list = []
+        while (rs.error_code == "0") and rs.next():
+            data_list.append(rs.get_row_data())
+        df = pd.DataFrame(data_list, columns=rs.fields)
+    finally:
+        bs.logout()
+
+    if df.empty:
+        logger.warning("行业分类获取为空，返回空表")
+        return pd.DataFrame(columns=["code", "name", "industry"])
+
+    df.columns = [c.lower() for c in df.columns]
+    # baostock返回: code, code_name, industry, industryclassification
+    if "code" in df.columns:
+        df["code"] = df["code"].astype(str).str.extract(r"(\d{6})", expand=False).fillna("").str.zfill(6)
+    if "code_name" in df.columns and "name" not in df.columns:
+        df = df.rename(columns={"code_name": "name"})
+    keep = [c for c in ["code", "name", "industry"] if c in df.columns]
+    df = df[keep].drop_duplicates(subset=["code"]).reset_index(drop=True)
+    df.to_csv(cache_path, index=False, encoding="utf-8-sig")
+    logger.info(f"股票行业分类获取完成，共 {len(df)} 只，已缓存")
+    return df
+
+
 def _code_to_baostock_symbol(code: str) -> str:
     """转换为baostock代码格式：sh.600000 / sz.000001"""
     code = str(code).zfill(6)

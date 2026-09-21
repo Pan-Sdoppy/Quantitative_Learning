@@ -17,3 +17,4 @@ akshare>=1.10      # A股盘中实时行情（新浪接口）
 # ========== 工具库 ==========
 tqdm>=4.60          # 进度条
 pyarrow              # parquet文件读写（pandas后端必需）
+openpyxl>=3.1         # Excel写入（预测结果predictions.xlsx多sheet）

@@ -28,8 +28,8 @@ def run_backtest(factor_data: pd.DataFrame, models: dict,
                  top_n: int = 3, horizons: list = None,
                  start_date: str = None, end_date: str = None,
                  transaction_cost: float = DEFAULT_TRANSACTION_COST,
-                 take_profit: float = 0.015,
-                 stop_loss: float = -0.025,
+                 take_profit: float = 0.01,
+                 stop_loss: float = -0.05,
                  filter_today_body_ret: float = None,
                  filter_today_day_ret: float = None,
                  weights: list = None) -> dict:
@@ -166,9 +166,9 @@ def _backtest_single_mode(factor_data: pd.DataFrame, model, mode: str, top_n: in
         if weights is not None:
             weights = list(weights)[:top_n] + [0.0] * max(0, top_n - len(weights))
         elif top_n == 3:
-            weights = [0.6, 0.4, 0.0]
+            weights = [1.0, 0.0, 0.0]
         elif top_n == 2:
-            weights = [0.6, 0.4]
+            weights = [1.0, 0.0]
         else:
             weights = [1.0 / top_n] * top_n
 
@@ -386,7 +386,7 @@ def _print_metrics(mode: str, m: dict, take_profit: float = 0.02, stop_loss: flo
     tp_str = f"止盈{take_profit * 100:.1f}%" if take_profit else "无止盈"
     sl_str = f"止损{stop_loss * 100:.1f}%" if stop_loss else "不止损"
     stop_desc = f"动态{tp_str}+{sl_str}"
-    weights = m.get("weights", [0.5, 0.3, 0.2])
+    weights = m.get("weights", [1.0, 0.0, 0.0])
     weight_str = ":".join([f"{w * 100:.0f}" for w in weights])
     logger.info(
         f"  1天持仓-{mode_desc} 回测结果 (Top3仓位{weight_str}, {stop_desc}, 已扣交易成本{DEFAULT_TRANSACTION_COST * 100:.2f}%/次, 剔除涨停股):")

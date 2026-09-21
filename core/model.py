@@ -432,6 +432,7 @@ class MLPModel:
             "feature_names": self.feature_names,
             "scaler_mean": self.scaler_mean,
             "scaler_std": self.scaler_std,
+            "best_epoch": self.best_epoch,
         }
         torch.save(state, str(path))
 
@@ -443,6 +444,7 @@ class MLPModel:
         self.feature_names = state.get("feature_names")
         self.scaler_mean = state["scaler_mean"]
         self.scaler_std = state["scaler_std"]
+        self.best_epoch = state.get("best_epoch", None)
         self.model = self._build_model().to(self.device)
         self.model.load_state_dict(state["model_state"])
         return self
