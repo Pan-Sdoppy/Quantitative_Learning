@@ -32,12 +32,20 @@ def run_backtest(factor_data: pd.DataFrame, models: dict,
                  stop_loss: float = -0.05,
                  filter_today_body_ret: float = None,
                  filter_today_day_ret: float = None,
+                 filter_today_day_ret_min: float = None,
+                 filter_yin_line: bool = False,
+                 filter_upper_shadow: float = None,
+                 intraday_take_profit: float = None,
                  weights: list = None) -> dict:
     """运行动态卖出回测（1d_close）
     take_profit: 高开止盈阈值（如0.02=高开2%开盘卖），None=无止盈
     stop_loss: 止损阈值（如-0.02=跌2%止损），None=不止损
     filter_today_body_ret: 方案一，T日实体涨幅(close-open)/open超过此阈值则剔除，None=不过滤
     filter_today_day_ret: 方案二，T日日涨幅(ret_1d_raw)超过此阈值则剔除，None=不过滤
+    filter_today_day_ret_min: T日日涨幅(ret_1d_raw)低于此阈值则剔除（剔除暴跌股），None=不过滤
+    filter_yin_line: 只买T日阴线收盘股（close<open），False=不过滤
+    filter_upper_shadow: T日上影线/close超过此阈值则剔除（冲高回落），None=不过滤
+    intraday_take_profit: 盘中最高价达到此阈值则止盈卖出（如0.01=盘中涨1%止盈），None=不启用
     weights: TopN仓位权重列表（如[0.5,0.3,0.2]），None=用默认（Top3全仓Top1）
     """
     if horizons is None:
@@ -60,10 +68,21 @@ def run_backtest(factor_data: pd.DataFrame, models: dict,
             filt_str += f"，T日实体涨幅>{filter_today_body_ret * 100:.1f}%剔除"
         if filter_today_day_ret is not None:
             filt_str += f"，T日日涨幅>{filter_today_day_ret * 100:.1f}%剔除"
+        if filter_today_day_ret_min is not None:
+            filt_str += f"，T日日涨幅<{filter_today_day_ret_min * 100:.1f}%剔除"
+        if filter_yin_line:
+            filt_str += "，只买阴线"
+        if filter_upper_shadow is not None:
+            filt_str += f"，上影线>{filter_upper_shadow * 100:.1f}%剔除"
+        if intraday_take_profit is not None:
+            filt_str += f"，盘中止盈{intraday_take_profit * 100:.1f}%"
         logger.info(f"开始回测: 1天持仓-动态卖出 ({h}){tp_str}{sl_str}, Top{top_n}{filt_str}")
         res = _backtest_single_mode(factor_data, models[h], h, top_n, transaction_cost,
                                     take_profit, stop_loss,
                                     filter_today_body_ret, filter_today_day_ret,
+                                    filter_today_day_ret_min,
+                                    filter_yin_line, filter_upper_shadow,
+                                    intraday_take_profit,
                                     weights)
         results[h] = res
         _print_metrics(h, res["metrics"], take_profit, stop_loss)
@@ -77,12 +96,20 @@ def _backtest_single_mode(factor_data: pd.DataFrame, model, mode: str, top_n: in
                           stop_loss: float = -0.02,
                           filter_today_body_ret: float = None,
                           filter_today_day_ret: float = None,
+                          filter_today_day_ret_min: float = None,
+                          filter_yin_line: bool = False,
+                          filter_upper_shadow: float = None,
+                          intraday_take_profit: float = None,
                           weights: list = None) -> dict:
     """单模式回测（1d_close 动态止盈+止损）
     take_profit: 高开止盈阈值（如0.02=高开2%开盘卖），None=无止盈
     stop_loss: 止损阈值（如-0.02=跌2%止损），None=不止损
     filter_today_body_ret: 方案一，T日实体涨幅(close-open)/open超过此阈值则剔除
     filter_today_day_ret: 方案二，T日日涨幅(ret_1d_raw)超过此阈值则剔除
+    filter_today_day_ret_min: T日日涨幅(ret_1d_raw)低于此阈值则剔除（剔除暴跌股）
+    filter_yin_line: 只买T日阴线收盘股（close<open）
+    filter_upper_shadow: T日上影线/close超过此阈值则剔除（冲高回落）
+    intraday_take_profit: 盘中最高价达到此阈值则止盈卖出，None=不启用
     weights: TopN仓位权重列表（如[0.5,0.3,0.2]），None=用默认（Top3全仓Top1）
     """
     feature_cols = [c for c in (model.feature_names or []) if c is not None and c in factor_data.columns]
@@ -101,6 +128,7 @@ def _backtest_single_mode(factor_data: pd.DataFrame, model, mode: str, top_n: in
     factor_data["_open_d1"] = g["open"].shift(-1)
     factor_data["_close_d1"] = g["close"].shift(-1)
     factor_data["_low_d1"] = g["low"].shift(-1)
+    factor_data["_high_d1"] = g["high"].shift(-1)
 
     # 市场择时：沪深300低于20日均线5%以上空仓（仅极端熊市）
     MARKET_TIMING_EMPTY = -0.05
@@ -155,6 +183,33 @@ def _backtest_single_mode(factor_data: pd.DataFrame, model, mode: str, top_n: in
             skipped_filter += before - len(day_data)
             if len(day_data) < before:
                 logger.debug(f"  {rebal_date:%Y-%m-%d}: 日涨幅过滤剔除{before - len(day_data)}只")
+
+        # 剔除T日暴跌股（ret_1d_raw < 下限阈值），避免接飞刀
+        if filter_today_day_ret_min is not None and "ret_1d_raw" in day_data.columns:
+            before = len(day_data)
+            day_data = day_data[day_data["ret_1d_raw"] > filter_today_day_ret_min]
+            skipped_filter += before - len(day_data)
+            if len(day_data) < before:
+                logger.debug(f"  {rebal_date:%Y-%m-%d}: 日跌幅下限过滤剔除{before - len(day_data)}只")
+
+        # 只买T日阴线收盘股（close < open）
+        if filter_yin_line:
+            before = len(day_data)
+            day_data = day_data[day_data["close"] < day_data["open"]]
+            skipped_filter += before - len(day_data)
+            if len(day_data) < before:
+                logger.debug(f"  {rebal_date:%Y-%m-%d}: 阴线过滤剔除{before - len(day_data)}只")
+
+        # 剔除T日上影线异常股（冲高回落，上方抛压重）
+        if filter_upper_shadow is not None and "high_low_ratio" in day_data.columns:
+            before = len(day_data)
+            high = day_data["high_low_ratio"] * day_data["low"]
+            body_top = day_data[["open", "close"]].max(axis=1)
+            upper_shadow = (high - body_top) / day_data["close"]
+            day_data = day_data[upper_shadow <= filter_upper_shadow]
+            skipped_filter += before - len(day_data)
+            if len(day_data) < before:
+                logger.debug(f"  {rebal_date:%Y-%m-%d}: 上影线过滤剔除{before - len(day_data)}只")
 
         if len(day_data) < top_n:
             continue
@@ -212,6 +267,14 @@ def _backtest_single_mode(factor_data: pd.DataFrame, model, mode: str, top_n: in
                 if low_ret <= stop_loss:
                     sell_price = buy_price * (1 + stop_loss)
                     is_stop_loss = True
+            # 盘中最高价达到止盈线 → 按止盈价成交（同时触及止盈止损时已在上方按止损保守处理）
+            if sell_price is None and intraday_take_profit is not None:
+                high_d1 = row.get("_high_d1", np.nan)
+                if not pd.isna(high_d1):
+                    high_ret = high_d1 / buy_price - 1
+                    if high_ret >= intraday_take_profit:
+                        sell_price = buy_price * (1 + intraday_take_profit)
+                        is_stop_loss = False
             if sell_price is None:
                 # 兜底逻辑：
                 # - low数据缺失(NaN)时回退旧逻辑：收盘价跌超止损线按止损价成交

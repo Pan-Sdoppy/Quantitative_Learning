@@ -30,8 +30,11 @@ logger = get_logger("backtest")
 BACKTEST_TAG = "latest/backtest"  # 回测自动加载回测模型（训练到2023-12-31）
 TOP_N = 3
 HORIZONS = ["1d_close"]
-# 当天大阳线过滤阈值：T日日涨幅(ret_1d_raw)>7%剔除（避免追高，经9组回测全周期最优）
+# 当天日涨幅区间过滤：T日日涨幅(ret_1d_raw)在(-3%, +7%)之外的剔除
+# 上限>7%剔除（避免追高），下限<-3%剔除（避免接飞刀，经5组回测(-3%,+7%)全周期最优：收益提升14%）
 FILTER_TODAY_DAY_RET = 0.07
+FILTER_TODAY_DAY_RET_MIN = -0.03
+INTRADAY_TAKE_PROFIT = 0.045  # 盘中最高价涨4.5%止盈（正确数据下最优阈值）
 
 
 def main():
@@ -133,6 +136,8 @@ def main():
         start_date=start_dt,
         end_date=None,
         filter_today_day_ret=FILTER_TODAY_DAY_RET,  # 当天日涨幅>7%剔除（避免追高）
+        filter_today_day_ret_min=FILTER_TODAY_DAY_RET_MIN,  # 当天日涨幅<-3%剔除（避免接飞刀）
+        intraday_take_profit=INTRADAY_TAKE_PROFIT,  # 盘中最高价涨4.5%止盈
     )
 
     # ========== Step 4: 保存结果 ==========

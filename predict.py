@@ -444,40 +444,52 @@ def main():
     print("=" * 100)
 
     # 保存完整预测结果到Excel（单文件多sheet，每天一个sheet，同日重跑覆盖旧数据）
-    from openpyxl.styles import Font
-    from openpyxl.utils import get_column_letter
-    excel_path = RESULT_DIR / PREDICT_TAG / "predictions.xlsx"
-    excel_path.parent.mkdir(parents=True, exist_ok=True)
-    sheet_name = latest_date.strftime("%Y-%m-%d")
+    # 盘中模式跳过Excel更新；任何异常只警告不中断
+    if not use_intraday:
+        try:
+            from openpyxl.styles import Font
+            from openpyxl.utils import get_column_letter
+            excel_path = RESULT_DIR / PREDICT_TAG / "predictions.xlsx"
+            excel_path.parent.mkdir(parents=True, exist_ok=True)
+            sheet_name = latest_date.strftime("%Y-%m-%d")
 
-    # Excel导出列：排名放第一列，剔除 latest_pct_chg/is_limit_up/pred_ret_1d_close
-    excel_cols = ["code", "name", "close", "limit_status", "industry",
-                  f"confidence_{available_horizons[0]}"]
-    excel_df = result[excel_cols].copy()
-    excel_df.insert(0, "排名", range(1, len(excel_df) + 1))
-    excel_df.columns = ["排名", "股票代码", "股票名称", "收盘价", "状态", "所属板块", "动态卖出置信度"]
-    excel_df["收盘价"] = excel_df["收盘价"].round(2)
+            excel_cols = ["code", "name", "close", "latest_pct_chg", "limit_status", "industry",
+                          f"confidence_{available_horizons[0]}"]
+            excel_df = result[excel_cols].copy()
+            excel_df.insert(0, "排名", range(1, len(excel_df) + 1))
+            excel_df.columns = ["排名", "股票代码", "股票名称", "收盘价", "当天涨幅", "状态", "所属板块", "动态卖出置信度"]
+            excel_df["收盘价"] = excel_df["收盘价"].round(2)
+            excel_df["当天涨幅"] = (excel_df["当天涨幅"] * 100).round(2).map(lambda x: f"{x:.2f}%")
 
-    file_exists = excel_path.exists()
-    excel_mode = "a" if file_exists else "w"
-    with pd.ExcelWriter(excel_path, engine="openpyxl", mode=excel_mode,
-                        if_sheet_exists="replace" if file_exists else None) as writer:
-        excel_df.to_excel(writer, sheet_name=sheet_name, index=False)
-        ws = writer.sheets[sheet_name]
-        for row in ws.iter_rows():
-            for cell in row:
-                cell.font = Font(name="微软雅黑", size=11)
-        # 列宽自适应
-        for col_idx, col in enumerate(ws.columns, 1):
-            max_len = 0
-            for cell in col:
-                if cell.value is not None:
-                    v = str(cell.value)
-                    w = sum(2 if ord(ch) > 127 else 1 for ch in v)
-                    if w > max_len:
-                        max_len = w
-            ws.column_dimensions[get_column_letter(col_idx)].width = max_len + 2
-    logger.info(f"预测结果已保存: {excel_path} [sheet={sheet_name}, {len(excel_df)}行]")
+            file_exists = excel_path.exists()
+            excel_mode = "a" if file_exists else "w"
+            with pd.ExcelWriter(excel_path, engine="openpyxl", mode=excel_mode,
+                                if_sheet_exists="replace" if file_exists else None) as writer:
+                excel_df.to_excel(writer, sheet_name=sheet_name, index=False)
+                ws = writer.sheets[sheet_name]
+                for row in ws.iter_rows():
+                    for cell in row:
+                        cell.font = Font(name="微软雅黑", size=11)
+                # 收盘价列（第4列）强制两位小数显示
+                for cell in ws["D"]:
+                    if cell.row > 1 and cell.value is not None:
+                        cell.number_format = "0.00"
+                for col_idx, col in enumerate(ws.columns, 1):
+                    max_len = 0
+                    for cell in col:
+                        if cell.value is not None:
+                            # D列(收盘价)按两位小数显示格式计算宽度
+                            if col_idx == 4 and cell.row > 1:
+                                v = f"{cell.value:.2f}"
+                            else:
+                                v = str(cell.value)
+                            w = sum(2 if ord(ch) > 127 else 1 for ch in v)
+                            if w > max_len:
+                                max_len = w
+                    ws.column_dimensions[get_column_letter(col_idx)].width = max_len + 2
+            logger.info(f"预测结果已保存: {excel_path} [sheet={sheet_name}, {len(excel_df)}行]")
+        except Exception as e:
+            logger.warning(f"Excel保存失败（已跳过）: {e}")
 
     # 推荐买入Top3
     logger.info("\n" + "=" * 70)

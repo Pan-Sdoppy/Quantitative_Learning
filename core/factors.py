@@ -170,8 +170,8 @@ def compute_factors(all_data: pd.DataFrame) -> tuple:
                 for c in factor_df.columns:
                     if c not in ["date", "code"] and factor_df[c].dtype == "float64":
                         factor_df[c] = factor_df[c].astype("float32")
-                # 只保留必要列：date, code, open, low, close + 因子（low用于回测盘中最低价止损）
-                keep = ["date", "code", "open", "low", "close"] + [
+                # 只保留必要列：date, code, open, high, low, close + 因子（high/low用于回测盘中止盈止损）
+                keep = ["date", "code", "open", "high", "low", "close"] + [
                     c for c in factor_df.columns if c not in
                                                     ["date", "code", "open", "high", "low", "close", "volume",
                                                      "amount", "amplitude", "pct_chg", "change", "turnover"]
@@ -200,7 +200,7 @@ def compute_factors(all_data: pd.DataFrame) -> tuple:
 
     # 识别因子列（ret_1d_raw保留原始收益率不标准化，用于涨停判断）
     result["ret_1d_raw"] = result["ret_1d"]
-    factor_cols = [c for c in result.columns if c not in ["date", "code", "open", "low", "close", "ret_1d_raw"]]
+    factor_cols = [c for c in result.columns if c not in ["date", "code", "open", "high", "low", "close", "ret_1d_raw", "high_low_ratio"]]
     logger.info(f"共 {len(factor_cols)} 个因子，{len(result)} 行，进行横截面标准化...")
 
     # 向量化横截面标准化：先算每日mean/std，再merge（比transform省内存）
