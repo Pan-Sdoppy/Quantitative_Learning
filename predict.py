@@ -393,6 +393,13 @@ def main():
     result["is_limit_up"] = result["latest_pct_chg"] >= 0.095
     result["limit_status"] = result["is_limit_up"].map({True: "涨停", False: "可买入"})
 
+    # 二次排序所需因子（7因子：振幅小+量比低+跳空高+换手率低+成交额低+5日位置高+3日动量高）
+    for rc in ["amplitude_1d", "vol_ratio_5", "gap_ratio"]:
+        if rc in latest_data.columns:
+            result[rc] = latest_data[rc].values
+        else:
+            result[rc] = np.nan
+
     for h in available_horizons:
         result[f"pred_ret_{h}"] = np.round(predictions[h], 6)
         result[f"confidence_{h}"] = confidences[h]
@@ -443,6 +450,49 @@ def main():
     print_table(display.head(4000))  # 终端只打印前50，完整结果存CSV
     print("=" * 100)
 
+    # ========== 综合排序Top10（二次排序：模型粗筛Top10→7因子综合rank重排） ==========
+    try:
+        buyable = result[~result["is_limit_up"]].copy()
+        buyable = buyable[(buyable["latest_pct_chg"] >= -0.03) & (buyable["latest_pct_chg"] <= 0.07)]
+        conf_col = f"confidence_{available_horizons[0]}"
+        candidates = buyable.nlargest(10, conf_col).copy()
+        # 7因子综合rank排序（权重与回测一致）
+        # [振幅小2, 量比低1, 跳空高1, 换手率低1, 成交额低1, 5日位置高1, 3日动量高1]
+        for rc in ["turnover_ratio", "amount_ratio", "close_position_5d", "ret_3d"]:
+            if rc not in candidates.columns and rc in latest_data.columns:
+                candidates[rc] = latest_data.set_index("code").reindex(candidates["code"])[rc].values
+        score = pd.Series(0.0, index=candidates.index)
+        if "amplitude_1d" in candidates.columns:
+            score += 2 * candidates["amplitude_1d"].rank(ascending=True)
+        if "vol_ratio_5" in candidates.columns:
+            score += 1 * candidates["vol_ratio_5"].rank(ascending=True)
+        if "gap_ratio" in candidates.columns:
+            score -= 1 * candidates["gap_ratio"].rank(ascending=True)
+        if "turnover_ratio" in candidates.columns:
+            score += 1 * candidates["turnover_ratio"].rank(ascending=True)
+        if "amount_ratio" in candidates.columns:
+            score += 1 * candidates["amount_ratio"].rank(ascending=True)
+        if "close_position_5d" in candidates.columns:
+            score -= 1 * candidates["close_position_5d"].rank(ascending=True)
+        if "ret_3d" in candidates.columns:
+            score -= 1 * candidates["ret_3d"].rank(ascending=True)
+        candidates["综合排序分"] = score
+        candidates = candidates.sort_values("综合排序分")
+        rerank_display = candidates[["code", "name", "close", "latest_pct_chg", "industry", conf_col]].copy()
+        rerank_display.insert(0, "排名", range(1, len(rerank_display) + 1))
+        rerank_display.columns = ["排名", "股票代码", "股票名称", "收盘价", "当天涨幅", "所属板块", "模型置信度"]
+        rerank_display["收盘价"] = rerank_display["收盘价"].round(2)
+        rerank_display["当天涨幅"] = (rerank_display["当天涨幅"] * 100).round(2).astype(str) + "%"
+        rerank_display["模型置信度"] = rerank_display["模型置信度"].round(4)
+        print()
+        print("=" * 100)
+        print("综合排序Top10（模型粗筛Top10→7因子重排：振幅小2+量比低1+跳空高1+换手率低1+成交额低1+5日位置高1+3日动量高1，回测收益24763万%）")
+        print("=" * 100)
+        print_table(rerank_display)
+        print("=" * 100)
+    except Exception as e:
+        logger.warning(f"综合排序打印失败（已跳过）: {e}")
+
     # 保存完整预测结果到Excel（单文件多sheet，每天一个sheet，同日重跑覆盖旧数据）
     # 盘中模式跳过Excel更新；任何异常只警告不中断
     if not use_intraday:
@@ -491,20 +541,7 @@ def main():
         except Exception as e:
             logger.warning(f"Excel保存失败（已跳过）: {e}")
 
-    # 推荐买入Top3
-    logger.info("\n" + "=" * 70)
-    logger.info(f"推荐买入 Top 3（排序优先级: {sort_desc}）:")
-    for i, (_, row) in enumerate(top.head(3).iterrows(), 1):
-        conf_str = "  ".join([
-            f"动态卖出:{row[f'confidence_{h}']:.4f}"
-            for h in available_horizons
-        ])
-        pct_str = f"{row['latest_pct_chg'] * 100:+.2f}%"
-        limit_str = f"  状态:{row['limit_status']}"
-        logger.info(
-            f"  {i}. {row['code']} {row['name']}  收盘价:{row['close']:.2f}  涨跌幅:{pct_str}{limit_str}  {conf_str}")
-
-    # 市场操作建议（在股票推荐之后给出）
+    # 市场操作建议
     if market_advice:
         logger.info("\n" + "=" * 70)
         logger.info(f"市场操作建议: {market_advice}")

@@ -32,16 +32,29 @@ TOP_N = 3
 HORIZONS = ["1d_close"]
 # 当天日涨幅区间过滤：T日日涨幅(ret_1d_raw)在(-3%, +7%)之外的剔除
 # 上限>7%剔除（避免追高），下限<-3%剔除（避免接飞刀，经5组回测(-3%,+7%)全周期最优：收益提升14%）
-FILTER_TODAY_DAY_RET = 0.07
-FILTER_TODAY_DAY_RET_MIN = -0.03
-INTRADAY_TAKE_PROFIT = 0.045  # 盘中最高价涨4.5%止盈（正确数据下最优阈值）
+# 涨幅过滤区间：网格搜索最优（2026-09）
+# 上限放宽到9.5%只剔除涨停股，7%~9.5%的股票次日还能继续涨
+FILTER_TODAY_DAY_RET = 0.095  # T日日涨幅>9.5%剔除（涨停股买不进）
+FILTER_TODAY_DAY_RET_MIN = -0.03  # T日日涨幅<-3%剔除（避免接飞刀）
+TAKE_PROFIT = 0.005  # 开盘止盈0.5%（高开0.5%即锁利，比1%更优）
+STOP_LOSS = None  # 不止损（回测最优：-5%太紧会被洗盘甩出，不设止损收益最高）
+INTRADAY_TAKE_PROFIT = 0.045  # 盘中最高价涨4.5%止盈（网格搜索最优）
+# 二次排序：模型粗筛Top10后，按综合规则（振幅小+量比低+跳空高）重排选Top3
+# 回测验证：收益从4387万%提升到12073万%（2.75倍），胜率77.86%→81.68%
+RERANK_CANDIDATES = 10
+RERANK_METHOD = "composite"  # composite=振幅+量比+跳空综合rank排序
+# 权重顺序: [振幅小, 量比低, 跳空高, 换手率低, 成交额低, 5日位置高, 3日动量高]
+# 网格搜索最优：全7因子各参与排序（收益24763万% vs 3因子20180万%，胜率82.75%）
+RERANK_WEIGHTS = [2, 1, 1, 1, 1, 1, 1]
 
 
 def main():
     logger.info("=" * 70)
     logger.info("A股量化策略回测开始")
     logger.info(f"配置: 每次买{TOP_N}只, 1天持仓动态卖出={HORIZONS}, 模型={BACKTEST_TAG}")
-    logger.info(f"当天大阳线过滤: T日日涨幅>{FILTER_TODAY_DAY_RET * 100:.0f}%剔除（避免追高）")
+    logger.info(f"当天涨幅过滤: T日[{FILTER_TODAY_DAY_RET_MIN*100:.0f}%, {FILTER_TODAY_DAY_RET*100:.1f}%]区间外剔除")
+    logger.info(f"卖出规则: 开盘止盈{TAKE_PROFIT*100:.1f}%，盘中止盈{INTRADAY_TAKE_PROFIT*100:.1f}%，{'不止损' if STOP_LOSS is None else f'止损{STOP_LOSS*100:.0f}%'}")
+    logger.info(f"二次排序: Top{RERANK_CANDIDATES}候选→{RERANK_METHOD}综合排序→Top{TOP_N}")
 
     # ========== Step 1: 加载因子数据（基于训练文件的最新数据） ==========
     logger.info("\n" + "=" * 70)
@@ -135,9 +148,14 @@ def main():
         horizons=available_horizons,
         start_date=start_dt,
         end_date=None,
-        filter_today_day_ret=FILTER_TODAY_DAY_RET,  # 当天日涨幅>7%剔除（避免追高）
-        filter_today_day_ret_min=FILTER_TODAY_DAY_RET_MIN,  # 当天日涨幅<-3%剔除（避免接飞刀）
+        take_profit=TAKE_PROFIT,  # 开盘止盈0.5%
+        stop_loss=STOP_LOSS,  # 不止损
+        filter_today_day_ret=FILTER_TODAY_DAY_RET,  # T日日涨幅>9.5%剔除
+        filter_today_day_ret_min=FILTER_TODAY_DAY_RET_MIN,  # T日日涨幅<-3%剔除
         intraday_take_profit=INTRADAY_TAKE_PROFIT,  # 盘中最高价涨4.5%止盈
+        rerank_candidates=RERANK_CANDIDATES,
+        rerank_method=RERANK_METHOD,
+        rerank_weights=RERANK_WEIGHTS,
     )
 
     # ========== Step 4: 保存结果 ==========

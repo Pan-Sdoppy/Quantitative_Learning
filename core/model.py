@@ -523,6 +523,22 @@ class EnsembleModel:
         return self
 
     def predict(self, X):
+        # 特征兼容：旧模型训练时含被错误标准化的 high_low_ratio（已修复不再作为因子），
+        # 预测时自动补0（训练时该特征标准化后均值为0，补0影响最小），避免 shape check 报错
+        import pandas as pd
+        import numpy as np
+        if hasattr(X, "columns") and self.feature_names is not None:
+            missing = [c for c in self.feature_names if c not in X.columns]
+            if missing:
+                for c in missing:
+                    X = X.copy()
+                    X[c] = 0.0
+                X = X[self.feature_names]
+        elif not hasattr(X, "columns") and self.feature_names is not None:
+            n_model = len(self.feature_names)
+            if X.shape[1] < n_model:
+                pad = np.zeros((X.shape[0], n_model - X.shape[1]), dtype=X.dtype)
+                X = np.hstack([X, pad])
         X_arr = X.values if hasattr(X, "values") else X
         pred_lgb = self.lgb.predict(X_arr)
         pred_xgb = self.xgb.predict(X_arr)

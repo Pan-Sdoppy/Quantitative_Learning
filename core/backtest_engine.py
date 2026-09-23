@@ -36,7 +36,16 @@ def run_backtest(factor_data: pd.DataFrame, models: dict,
                  filter_yin_line: bool = False,
                  filter_upper_shadow: float = None,
                  intraday_take_profit: float = None,
-                 weights: list = None) -> dict:
+                 weights: list = None,
+                 filter_min_mv: float = None,
+                 only_prev_limit_up: bool = False,
+                 prev_limit_up_open_buy: bool = False,
+                 skip_if_index_down: bool = False,
+                 filter_amplitude_max: float = None,
+                 filter_vol_ratio_max: float = None,
+                 rerank_candidates: int = None,
+                 rerank_method: str = None,
+                 rerank_weights: list = None) -> dict:
     """运行动态卖出回测（1d_close）
     take_profit: 高开止盈阈值（如0.02=高开2%开盘卖），None=无止盈
     stop_loss: 止损阈值（如-0.02=跌2%止损），None=不止损
@@ -47,6 +56,15 @@ def run_backtest(factor_data: pd.DataFrame, models: dict,
     filter_upper_shadow: T日上影线/close超过此阈值则剔除（冲高回落），None=不过滤
     intraday_take_profit: 盘中最高价达到此阈值则止盈卖出（如0.01=盘中涨1%止盈），None=不启用
     weights: TopN仓位权重列表（如[0.5,0.3,0.2]），None=用默认（Top3全仓Top1）
+    filter_min_mv: 剔除流通市值低于此阈值（亿元）的小票，None=不剔除
+    only_prev_limit_up: 只买前一天涨停且当天非涨停（开板）的股票（打板次日接力策略）
+    prev_limit_up_open_buy: T日涨停Top1→T+1开盘价买入→T+2动态卖出（打板次日开盘接力）
+    skip_if_index_down: 大盘（沪深300）当天收阴线则空仓不买
+    filter_amplitude_max: 当日振幅(amplitude_1d z-score)超过此值则剔除，None=不过滤
+    filter_vol_ratio_max: 5日量比(vol_ratio_5 z-score)超过此值则剔除，None=不过滤
+    rerank_candidates: 先从全市场选TopN候选再二次排序；None=不启用
+    rerank_method: 二次排序方式 amplitude_asc/vol_ratio_asc/gap_desc/composite
+    rerank_weights: composite模式三个因子权重 [w_amp, w_vol, w_gap]，None=[1,1,1]
     """
     if horizons is None:
         horizons = ["1d_close"]
@@ -76,6 +94,20 @@ def run_backtest(factor_data: pd.DataFrame, models: dict,
             filt_str += f"，上影线>{filter_upper_shadow * 100:.1f}%剔除"
         if intraday_take_profit is not None:
             filt_str += f"，盘中止盈{intraday_take_profit * 100:.1f}%"
+        if filter_min_mv is not None:
+            filt_str += f"，市值>={filter_min_mv}亿"
+        if only_prev_limit_up:
+            filt_str += "，仅前一天涨停"
+        if prev_limit_up_open_buy:
+            filt_str += "，打板次日开盘接力"
+        if skip_if_index_down:
+            filt_str += "，大盘阴线空仓"
+        if filter_amplitude_max is not None:
+            filt_str += f"，振幅<={filter_amplitude_max}"
+        if filter_vol_ratio_max is not None:
+            filt_str += f"，量比<={filter_vol_ratio_max}"
+        if rerank_candidates is not None:
+            filt_str += f"，二次排序Top{rerank_candidates}/{rerank_method}"
         logger.info(f"开始回测: 1天持仓-动态卖出 ({h}){tp_str}{sl_str}, Top{top_n}{filt_str}")
         res = _backtest_single_mode(factor_data, models[h], h, top_n, transaction_cost,
                                     take_profit, stop_loss,
@@ -83,7 +115,16 @@ def run_backtest(factor_data: pd.DataFrame, models: dict,
                                     filter_today_day_ret_min,
                                     filter_yin_line, filter_upper_shadow,
                                     intraday_take_profit,
-                                    weights)
+                                    weights,
+                                    filter_min_mv,
+                                    only_prev_limit_up,
+                                    prev_limit_up_open_buy,
+                                    skip_if_index_down,
+                                    filter_amplitude_max,
+                                    filter_vol_ratio_max,
+                                    rerank_candidates,
+                                    rerank_method,
+                                    rerank_weights)
         results[h] = res
         _print_metrics(h, res["metrics"], take_profit, stop_loss)
 
@@ -100,7 +141,16 @@ def _backtest_single_mode(factor_data: pd.DataFrame, model, mode: str, top_n: in
                           filter_yin_line: bool = False,
                           filter_upper_shadow: float = None,
                           intraday_take_profit: float = None,
-                          weights: list = None) -> dict:
+                          weights: list = None,
+                          filter_min_mv: float = None,
+                          only_prev_limit_up: bool = False,
+                          prev_limit_up_open_buy: bool = False,
+                          skip_if_index_down: bool = False,
+                          filter_amplitude_max: float = None,
+                          filter_vol_ratio_max: float = None,
+                          rerank_candidates: int = None,
+                          rerank_method: str = None,
+                          rerank_weights: list = None) -> dict:
     """单模式回测（1d_close 动态止盈+止损）
     take_profit: 高开止盈阈值（如0.02=高开2%开盘卖），None=无止盈
     stop_loss: 止损阈值（如-0.02=跌2%止损），None=不止损
@@ -111,6 +161,15 @@ def _backtest_single_mode(factor_data: pd.DataFrame, model, mode: str, top_n: in
     filter_upper_shadow: T日上影线/close超过此阈值则剔除（冲高回落）
     intraday_take_profit: 盘中最高价达到此阈值则止盈卖出，None=不启用
     weights: TopN仓位权重列表（如[0.5,0.3,0.2]），None=用默认（Top3全仓Top1）
+    filter_min_mv: 剔除流通市值低于此阈值（亿元）的小票，None=不剔除
+    only_prev_limit_up: 只买前一天涨停且当天非涨停（开板）的股票（打板次日接力策略）
+    prev_limit_up_open_buy: T日涨停Top1→T+1开盘价买入→T+2动态卖出（打板次日开盘接力）
+    skip_if_index_down: 大盘（沪深300）当天收阴线则空仓不买
+    filter_amplitude_max: 当日振幅(amplitude_1d z-score)超过此值则剔除（低振幅过滤），None=不过滤
+    filter_vol_ratio_max: 5日量比(vol_ratio_5 z-score)超过此值则剔除（缩量过滤），None=不过滤
+    rerank_candidates: 先从全市场选TopN候选，再二次排序取TopN；None=不启用二次排序
+    rerank_method: 二次排序方式 amplitude_asc/vol_ratio_asc/gap_desc/composite
+    rerank_weights: composite模式三个因子权重 [w_amp, w_vol, w_gap]，None=[1,1,1]
     """
     feature_cols = [c for c in (model.feature_names or []) if c is not None and c in factor_data.columns]
     if not feature_cols:
@@ -129,6 +188,40 @@ def _backtest_single_mode(factor_data: pd.DataFrame, model, mode: str, top_n: in
     factor_data["_close_d1"] = g["close"].shift(-1)
     factor_data["_low_d1"] = g["low"].shift(-1)
     factor_data["_high_d1"] = g["high"].shift(-1)
+    factor_data["_open_d2"] = g["open"].shift(-2)
+    factor_data["_close_d2"] = g["close"].shift(-2)
+    factor_data["_low_d2"] = g["low"].shift(-2)
+    factor_data["_high_d2"] = g["high"].shift(-2)
+
+    # 前一天涨停标记（T-1日涨停，T日可能开板可买）
+    factor_data["_prev_limit_up"] = (g["ret_1d_raw"].shift(1) >= LIMIT_UP_THRESHOLD).astype(float)
+
+    # 市值过滤：从原始数据加载流通市值（亿）= amount / (turnover/100) / 1e8
+    if filter_min_mv is not None:
+        logger.info(f"加载流通市值数据（剔除<{filter_min_mv}亿小票）...")
+        from pathlib import Path
+        raw_dir = Path(__file__).parent.parent / "data" / "raw"
+        mv_parts = []
+        for fp_raw in raw_dir.glob("*.parquet"):
+            try:
+                d = pd.read_parquet(fp_raw, columns=["date", "amount", "turnover"])
+                d["code"] = fp_raw.stem
+                d = d[d["turnover"] > 0]
+                d["_mv_yi"] = d["amount"] / (d["turnover"] / 100.0) / 1e8
+                mv_parts.append(d[["date", "code", "_mv_yi"]])
+            except Exception:
+                continue
+        if mv_parts:
+            mv_df = pd.concat(mv_parts, ignore_index=True)
+            mv_df["date"] = pd.to_datetime(mv_df["date"])
+            mv_df["code"] = mv_df["code"].astype(str).str.zfill(6)
+            factor_data["code"] = factor_data["code"].astype(str).str.zfill(6)
+            factor_data = factor_data.merge(mv_df, on=["date", "code"], how="left")
+            factor_data["_mv_yi"] = factor_data["_mv_yi"].fillna(9999)  # 无市值数据的不剔除
+            del mv_df, mv_parts
+        else:
+            logger.warning("未找到原始市值数据，跳过市值过滤")
+            filter_min_mv = None
 
     # 市场择时：沪深300低于20日均线5%以上空仓（仅极端熊市）
     MARKET_TIMING_EMPTY = -0.05
@@ -156,16 +249,37 @@ def _backtest_single_mode(factor_data: pd.DataFrame, model, mode: str, top_n: in
                 equity_points.append({"date": rebal_date, "equity": equity})
                 continue
 
+        # 大盘当天收阴线则空仓（沪深300当日收益<0）
+        if skip_if_index_down and "hs300_ret_1d" in day_data.columns:
+            idx_ret = day_data["hs300_ret_1d"].iloc[0]
+            if idx_ret < 0:
+                skipped_empty += 1
+                equity_points.append({"date": rebal_date, "equity": equity})
+                continue
+
         X = day_data[feature_cols].values
         preds = model.predict(X)
         day_data["pred"] = preds
 
         # 剔除T日涨停股（尾盘封单买不进，实盘无法成交）
-        if "ret_1d_raw" in day_data.columns:
+        # 打板次日开盘接力(prev_limit_up_open_buy)不剔除涨停，反而只选涨停
+        if "ret_1d_raw" in day_data.columns and not prev_limit_up_open_buy:
             before = len(day_data)
             day_data = day_data[day_data["ret_1d_raw"] < LIMIT_UP_THRESHOLD]
             if len(day_data) < before:
                 logger.debug(f"  {rebal_date:%Y-%m-%d}: 剔除{before - len(day_data)}只涨停股")
+        if prev_limit_up_open_buy and "ret_1d_raw" in day_data.columns:
+            before = len(day_data)
+            day_data = day_data[day_data["ret_1d_raw"] >= LIMIT_UP_THRESHOLD]
+            if len(day_data) < before:
+                logger.debug(f"  {rebal_date:%Y-%m-%d}: 非涨停过滤剔除{before - len(day_data)}只")
+
+        # 只买前一天涨停的股票（打板次日接力）
+        if only_prev_limit_up:
+            before = len(day_data)
+            day_data = day_data[day_data["_prev_limit_up"] == 1.0]
+            if len(day_data) < before:
+                logger.debug(f"  {rebal_date:%Y-%m-%d}: 非前涨停过滤剔除{before - len(day_data)}只")
 
         # 方案一：剔除T日实体大阳线（(close-open)/open > 阈值），避免追高
         if filter_today_body_ret is not None:
@@ -200,6 +314,30 @@ def _backtest_single_mode(factor_data: pd.DataFrame, model, mode: str, top_n: in
             if len(day_data) < before:
                 logger.debug(f"  {rebal_date:%Y-%m-%d}: 阴线过滤剔除{before - len(day_data)}只")
 
+        # 剔除流通市值过小的小票
+        if filter_min_mv is not None and "_mv_yi" in day_data.columns:
+            before = len(day_data)
+            day_data = day_data[day_data["_mv_yi"] >= filter_min_mv]
+            skipped_filter += before - len(day_data)
+            if len(day_data) < before:
+                logger.debug(f"  {rebal_date:%Y-%m-%d}: 市值过滤剔除{before - len(day_data)}只")
+
+        # 低振幅过滤：当日振幅z-score超过阈值则剔除（盈利股特征：振幅小）
+        if filter_amplitude_max is not None and "amplitude_1d" in day_data.columns:
+            before = len(day_data)
+            day_data = day_data[day_data["amplitude_1d"] <= filter_amplitude_max]
+            skipped_filter += before - len(day_data)
+            if len(day_data) < before:
+                logger.debug(f"  {rebal_date:%Y-%m-%d}: 振幅过滤剔除{before - len(day_data)}只")
+
+        # 缩量过滤：5日量比z-score超过阈值则剔除（盈利股特征：缩量）
+        if filter_vol_ratio_max is not None and "vol_ratio_5" in day_data.columns:
+            before = len(day_data)
+            day_data = day_data[day_data["vol_ratio_5"] <= filter_vol_ratio_max]
+            skipped_filter += before - len(day_data)
+            if len(day_data) < before:
+                logger.debug(f"  {rebal_date:%Y-%m-%d}: 量比过滤剔除{before - len(day_data)}只")
+
         # 剔除T日上影线异常股（冲高回落，上方抛压重）
         if filter_upper_shadow is not None and "high_low_ratio" in day_data.columns:
             before = len(day_data)
@@ -214,8 +352,38 @@ def _backtest_single_mode(factor_data: pd.DataFrame, model, mode: str, top_n: in
         if len(day_data) < top_n:
             continue
 
-        # 选TopN，按置信度加权（Top1 60%, Top2 40%, Top3 0%，只买Top1+Top2）
-        selected = day_data.nlargest(top_n, "pred")
+        # 二次排序：先选Top rerank_candidates 候选，再按规则重排
+        if rerank_candidates is not None and rerank_method is not None:
+            candidates = day_data.nlargest(min(rerank_candidates, len(day_data)), "pred")
+            if rerank_method == "amplitude_asc" and "amplitude_1d" in candidates.columns:
+                candidates = candidates.sort_values("amplitude_1d", ascending=True)
+            elif rerank_method == "vol_ratio_asc" and "vol_ratio_5" in candidates.columns:
+                candidates = candidates.sort_values("vol_ratio_5", ascending=True)
+            elif rerank_method == "gap_desc" and "gap_ratio" in candidates.columns:
+                candidates = candidates.sort_values("gap_ratio", ascending=False)
+            elif rerank_method == "composite":
+                # 7因子综合rank排序，权重顺序:
+                # [振幅小, 量比低, 跳空高, 换手率低, 成交额低, 5日位置高, 3日动量高]
+                w = rerank_weights or [2, 1, 1, 0, 0, 0, 0]
+                score = pd.Series(0.0, index=candidates.index)
+                if "amplitude_1d" in candidates.columns:
+                    score += w[0] * candidates["amplitude_1d"].rank(ascending=True)
+                if "vol_ratio_5" in candidates.columns:
+                    score += w[1] * candidates["vol_ratio_5"].rank(ascending=True)
+                if "gap_ratio" in candidates.columns:
+                    score -= w[2] * candidates["gap_ratio"].rank(ascending=True)
+                if "turnover_ratio" in candidates.columns:
+                    score += w[3] * candidates["turnover_ratio"].rank(ascending=True)
+                if "amount_ratio" in candidates.columns:
+                    score += w[4] * candidates["amount_ratio"].rank(ascending=True)
+                if "close_position_5d" in candidates.columns:
+                    score -= w[5] * candidates["close_position_5d"].rank(ascending=True)
+                if "ret_3d" in candidates.columns:
+                    score -= w[6] * candidates["ret_3d"].rank(ascending=True)
+                candidates = candidates.assign(_rerank_score=score).sort_values("_rerank_score")
+            selected = candidates.head(top_n)
+        else:
+            selected = day_data.nlargest(top_n, "pred")
         selected_codes = selected["code"].tolist()
         selected_preds = selected["pred"].tolist()
         if weights is not None:
@@ -232,11 +400,15 @@ def _backtest_single_mode(factor_data: pd.DataFrame, model, mode: str, top_n: in
 
         for _, row in selected.iterrows():
             code = row["code"]
-            buy_price = row["close"]  # T日尾盘买入价
+            if prev_limit_up_open_buy:
+                buy_price = row.get("_open_d1", np.nan)  # T+1开盘价买入
+                hold_days = 2
+            else:
+                buy_price = row["close"]  # T日尾盘买入价
+                hold_days = 1
             if pd.isna(buy_price) or buy_price <= 0:
                 continue
 
-            hold_days = 1
             is_stop_loss = False
 
             # 动态卖出：动态止盈+止损
@@ -245,9 +417,16 @@ def _backtest_single_mode(factor_data: pd.DataFrame, model, mode: str, top_n: in
             # 3. 盘中最低价跌破-2%止损线 → 按止损价成交（即使尾盘拉回止损线以上，
             #    实盘止损单在盘中触及-2%时已触发成交，回测必须按止损价计，不能按收盘价高估收益）
             # 4. 否则 → 收盘价卖出
-            open_d1 = row["_open_d1"]
-            close_d1 = row["_close_d1"]
-            low_d1 = row.get("_low_d1", np.nan)
+            if prev_limit_up_open_buy:
+                open_d1 = row.get("_open_d2", np.nan)
+                close_d1 = row.get("_close_d2", np.nan)
+                low_d1 = row.get("_low_d2", np.nan)
+                high_d1_sell = row.get("_high_d2", np.nan)
+            else:
+                open_d1 = row["_open_d1"]
+                close_d1 = row["_close_d1"]
+                low_d1 = row.get("_low_d1", np.nan)
+                high_d1_sell = row.get("_high_d1", np.nan)
             if pd.isna(close_d1):
                 continue
             sell_price = None
@@ -269,9 +448,8 @@ def _backtest_single_mode(factor_data: pd.DataFrame, model, mode: str, top_n: in
                     is_stop_loss = True
             # 盘中最高价达到止盈线 → 按止盈价成交（同时触及止盈止损时已在上方按止损保守处理）
             if sell_price is None and intraday_take_profit is not None:
-                high_d1 = row.get("_high_d1", np.nan)
-                if not pd.isna(high_d1):
-                    high_ret = high_d1 / buy_price - 1
+                if not pd.isna(high_d1_sell):
+                    high_ret = high_d1_sell / buy_price - 1
                     if high_ret >= intraday_take_profit:
                         sell_price = buy_price * (1 + intraday_take_profit)
                         is_stop_loss = False
