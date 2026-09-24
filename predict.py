@@ -453,7 +453,7 @@ def main():
     # ========== 综合排序Top10（二次排序：模型粗筛Top10→7因子综合rank重排） ==========
     try:
         buyable = result[~result["is_limit_up"]].copy()
-        buyable = buyable[(buyable["latest_pct_chg"] >= -0.03) & (buyable["latest_pct_chg"] <= 0.07)]
+        buyable = buyable[(buyable["latest_pct_chg"] >= -0.03) & (buyable["latest_pct_chg"] <= 0.095)]  # 与回测一致：只剔除涨停股
         conf_col = f"confidence_{available_horizons[0]}"
         candidates = buyable.nlargest(10, conf_col).copy()
         # 7因子综合rank排序（权重与回测一致）
