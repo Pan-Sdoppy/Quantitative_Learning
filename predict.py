@@ -6,7 +6,7 @@
 2. 计算最新因子
 3. 加载已训练的预测模型，对全市场股票预测
 4. 给出1天持仓动态卖出的置信度（保留4位小数）：
-      - 1d_close: T日尾盘买，T+1尾盘收盘卖
+      - 1d_close: T日尾盘买，T+1动态卖（开盘0.5%止盈+盘中4.5%止盈）
 5. 按动态卖出置信度优先排序，输出Top股票推荐
 6. 打印本次预测基于的数据时间范围
 
@@ -450,14 +450,14 @@ def main():
     print_table(display.head(4000))  # 终端只打印前50，完整结果存CSV
     print("=" * 100)
 
-    # ========== 综合排序Top10（二次排序：模型粗筛Top10→7因子综合rank重排） ==========
+    # ========== 综合排序Top10（二次排序：模型粗筛Top10→7因子手工composite重排） ==========
     try:
         buyable = result[~result["is_limit_up"]].copy()
-        buyable = buyable[(buyable["latest_pct_chg"] >= -0.03) & (buyable["latest_pct_chg"] <= 0.095)]  # 与回测一致：只剔除涨停股
+        buyable = buyable[buyable["latest_pct_chg"] <= 0.090]  # 涨幅过滤：无下限，上限9.0%（网格搜索最优）
         conf_col = f"confidence_{available_horizons[0]}"
+        pred_col = f"pred_ret_{available_horizons[0]}"
         candidates = buyable.nlargest(10, conf_col).copy()
-        # 7因子综合rank排序（权重与回测一致）
-        # [振幅小2, 量比低1, 跳空高1, 换手率低1, 成交额低1, 5日位置高1, 3日动量高1]
+        candidates["pred"] = candidates[pred_col]
         for rc in ["turnover_ratio", "amount_ratio", "close_position_5d", "ret_3d"]:
             if rc not in candidates.columns and rc in latest_data.columns:
                 candidates[rc] = latest_data.set_index("code").reindex(candidates["code"])[rc].values
@@ -465,7 +465,7 @@ def main():
         if "amplitude_1d" in candidates.columns:
             score += 2 * candidates["amplitude_1d"].rank(ascending=True)
         if "vol_ratio_5" in candidates.columns:
-            score += 1 * candidates["vol_ratio_5"].rank(ascending=True)
+            score += 2 * candidates["vol_ratio_5"].rank(ascending=True)  # 量比权重2（网格搜索最优）
         if "gap_ratio" in candidates.columns:
             score -= 1 * candidates["gap_ratio"].rank(ascending=True)
         if "turnover_ratio" in candidates.columns:
@@ -478,6 +478,7 @@ def main():
             score -= 1 * candidates["ret_3d"].rank(ascending=True)
         candidates["综合排序分"] = score
         candidates = candidates.sort_values("综合排序分")
+        rerank_desc = "7因子手工重排"
         rerank_display = candidates[["code", "name", "close", "latest_pct_chg", "industry", conf_col]].copy()
         rerank_display.insert(0, "排名", range(1, len(rerank_display) + 1))
         rerank_display.columns = ["排名", "股票代码", "股票名称", "收盘价", "当天涨幅", "所属板块", "模型置信度"]
@@ -486,7 +487,7 @@ def main():
         rerank_display["模型置信度"] = rerank_display["模型置信度"].round(4)
         print()
         print("=" * 100)
-        print("综合排序Top10（模型粗筛Top10→7因子重排：振幅小2+量比低1+跳空高1+换手率低1+成交额低1+5日位置高1+3日动量高1，回测收益24763万%）")
+        print(f"综合排序Top10（模型粗筛Top10→{rerank_desc}）")
         print("=" * 100)
         print_table(rerank_display)
         print("=" * 100)
@@ -507,7 +508,8 @@ def main():
                           f"confidence_{available_horizons[0]}"]
             excel_df = result[excel_cols].copy()
             excel_df.insert(0, "排名", range(1, len(excel_df) + 1))
-            excel_df.columns = ["排名", "股票代码", "股票名称", "收盘价", "当天涨幅", "状态", "所属板块", "动态卖出置信度"]
+            excel_df.columns = ["排名", "股票代码", "股票名称", "收盘价", "当天涨幅", "状态", "所属板块",
+                                "动态卖出置信度"]
             excel_df["收盘价"] = excel_df["收盘价"].round(2)
             excel_df["当天涨幅"] = (excel_df["当天涨幅"] * 100).round(2).map(lambda x: f"{x:.2f}%")
 

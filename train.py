@@ -15,8 +15,8 @@
     python train.py --skip-backtest  # 只训练预测模型，跳过回测模型（回测模型固定2016~2023，无需每次重训）
 """
 import argparse
-import sys
 import json
+import sys
 import warnings
 from datetime import datetime
 
@@ -237,7 +237,8 @@ def main():
     args = parse_args()
     logger.info("=" * 70)
     logger.info("A股量化模型训练开始")
-    logger.info(f"参数: update={args.update}, skip_backtest={args.skip_backtest}, start={START_DATE}, horizons={HORIZONS_DEFAULT}")
+    logger.info(
+        f"参数: update={args.update}, skip_backtest={args.skip_backtest}, start={START_DATE}, horizons={HORIZONS_DEFAULT}")
 
     # GPU检测
     gpu_info = detect_gpu()
@@ -257,8 +258,10 @@ def main():
             n_failed = stats.get("failed", 0)
             if n_failed > FAILED_THRESHOLD:
                 logger.error("=" * 70)
-                logger.error(f"数据完整性校验失败：本次增量更新有 {n_failed} 只股票下载失败，超过阈值 {FAILED_THRESHOLD} 只。")
-                logger.error("为保证训练数据唯一准确性，终止本次训练。请重新运行 python train.py --update 补齐失败股票后再训练。")
+                logger.error(
+                    f"数据完整性校验失败：本次增量更新有 {n_failed} 只股票下载失败，超过阈值 {FAILED_THRESHOLD} 只。")
+                logger.error(
+                    "为保证训练数据唯一准确性，终止本次训练。请重新运行 python train.py --update 补齐失败股票后再训练。")
                 logger.error("=" * 70)
                 sys.exit(1)
             try:
@@ -320,7 +323,7 @@ def main():
 
     # ========== Step 3: 创建标签 ==========
     logger.info("\n" + "=" * 70)
-    logger.info("Step 3: 创建标签 (1天持仓，动态卖出（高开2%止盈+跌2%止损）)")
+    logger.info("Step 3: 创建标签 (1天持仓，动态卖出：开盘止盈0.5% + 盘中止盈4.5% + 不止损)")
     labeled = create_labels(factor_data, horizons=HORIZONS_DEFAULT)
 
     # ========== Step 4: 训练两套模型（回测用 + 预测用） ==========

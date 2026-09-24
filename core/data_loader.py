@@ -251,7 +251,7 @@ def _download_single(code: str, start_date: str, end_date: str, retries: int = 2
             if len(df) >= 2 and len(df) > 20:
                 max_jump = df["close"].pct_change().abs().max()
                 if max_jump > 0.20:
-                    logger.warning(f"股票 {code}({symbol}) 数据异常(单日跳空{max_jump*100:.1f}%)，可能串行，丢弃重试")
+                    logger.warning(f"股票 {code}({symbol}) 数据异常(单日跳空{max_jump * 100:.1f}%)，可能串行，丢弃重试")
                     if attempt < retries - 1:
                         time.sleep(1)
                         continue

@@ -175,6 +175,8 @@ def _backtest_single_mode(factor_data: pd.DataFrame, model, mode: str, top_n: in
     if not feature_cols:
         raise ValueError("模型特征列与数据不匹配")
 
+    # 二次排序：手工composite规则（学习型reranker经A/B测试为负向，已删除）
+
     all_dates = sorted(factor_data["date"].unique())
     # 1天持仓，每个交易日调仓
     rebalance_dates = all_dates
@@ -362,9 +364,8 @@ def _backtest_single_mode(factor_data: pd.DataFrame, model, mode: str, top_n: in
             elif rerank_method == "gap_desc" and "gap_ratio" in candidates.columns:
                 candidates = candidates.sort_values("gap_ratio", ascending=False)
             elif rerank_method == "composite":
-                # 7因子综合rank排序，权重顺序:
-                # [振幅小, 量比低, 跳空高, 换手率低, 成交额低, 5日位置高, 3日动量高]
-                w = rerank_weights or [2, 1, 1, 0, 0, 0, 0]
+                # 手工composite：7因子rank排序
+                w = rerank_weights or [2, 2, 1, 1, 1, 1, 1]
                 score = pd.Series(0.0, index=candidates.index)
                 if "amplitude_1d" in candidates.columns:
                     score += w[0] * candidates["amplitude_1d"].rank(ascending=True)

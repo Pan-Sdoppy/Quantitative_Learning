@@ -4,11 +4,10 @@
 功能：
 1. 加载已训练的回测模型
 2. 基于训练文件的最新数据，在验证集上回测1天持仓动态卖出：
-      - 1d_close: T日尾盘买，动态卖出（高开2%止盈+跌2%止损）
+      - 1d_close: T日尾盘买，动态卖出（开盘止盈0.5%+盘中止盈4.5%，不止损）
 3. 每次买3只股票，输出累计收益、年化、夏普、最大回撤、胜率、年度收益等指标
 4. 保存交易明细和净值曲线（覆盖保存）
-5. 已启用当天大阳线过滤：T日日涨幅(ret_1d_raw)>7%的股票剔除，避免追高
-   （经9组回测对比，方案二日涨>7%全周期最优：夏普11.59→12.06，2026收益886%→1020%）
+5. 已启用当天涨幅过滤：T日日涨幅>9.5%剔除涨停股，<-3%剔除暴跌股
 
 用法：
     python backtest.py
@@ -30,30 +29,29 @@ logger = get_logger("backtest")
 BACKTEST_TAG = "latest/backtest"  # 回测自动加载回测模型（训练到2023-12-31）
 TOP_N = 3
 HORIZONS = ["1d_close"]
-# 当天日涨幅区间过滤：T日日涨幅(ret_1d_raw)在(-3%, +7%)之外的剔除
-# 上限>7%剔除（避免追高），下限<-3%剔除（避免接飞刀，经5组回测(-3%,+7%)全周期最优：收益提升14%）
-# 涨幅过滤区间：网格搜索最优（2026-09）
-# 上限放宽到9.5%只剔除涨停股，7%~9.5%的股票次日还能继续涨
-FILTER_TODAY_DAY_RET = 0.095  # T日日涨幅>9.5%剔除（涨停股买不进）
-FILTER_TODAY_DAY_RET_MIN = -0.03  # T日日涨幅<-3%剔除（避免接飞刀）
-TAKE_PROFIT = 0.005  # 开盘止盈0.5%（高开0.5%即锁利，比1%更优）
+# 当天日涨幅区间过滤：T日日涨幅在(-3%, +9.5%)之外的剔除
+# 上限>9.5%剔除涨停股（尾盘封单买不进），下限<-3%剔除暴跌股（避免接飞刀）
+FILTER_TODAY_DAY_RET = 0.090  # T日日涨幅>9.0%剔除（涨停股买不进）
+FILTER_TODAY_DAY_RET_MIN = None  # 不设下限（网格搜索最优：无下限收益最高）
+TAKE_PROFIT = 0.015  # 开盘止盈1.5%（网格搜索最优）
 STOP_LOSS = None  # 不止损（回测最优：-5%太紧会被洗盘甩出，不设止损收益最高）
-INTRADAY_TAKE_PROFIT = 0.045  # 盘中最高价涨4.5%止盈（网格搜索最优）
+INTRADAY_TAKE_PROFIT = 0.040  # 盘中最高价涨4.0%止盈（网格搜索最优）
 # 二次排序：模型粗筛Top10后，按综合规则（振幅小+量比低+跳空高）重排选Top3
 # 回测验证：收益从4387万%提升到12073万%（2.75倍），胜率77.86%→81.68%
 RERANK_CANDIDATES = 10
 RERANK_METHOD = "composite"  # composite=振幅+量比+跳空综合rank排序
 # 权重顺序: [振幅小, 量比低, 跳空高, 换手率低, 成交额低, 5日位置高, 3日动量高]
 # 网格搜索最优：全7因子各参与排序（收益24763万% vs 3因子20180万%，胜率82.75%）
-RERANK_WEIGHTS = [2, 1, 1, 1, 1, 1, 1]
+RERANK_WEIGHTS = [2, 2, 1, 1, 1, 1, 1]  # 振幅2+量比2（网格搜索最优：10014万%，夏普15.29）
 
 
 def main():
     logger.info("=" * 70)
     logger.info("A股量化策略回测开始")
     logger.info(f"配置: 每次买{TOP_N}只, 1天持仓动态卖出={HORIZONS}, 模型={BACKTEST_TAG}")
-    logger.info(f"当天涨幅过滤: T日[{FILTER_TODAY_DAY_RET_MIN*100:.0f}%, {FILTER_TODAY_DAY_RET*100:.1f}%]区间外剔除")
-    logger.info(f"卖出规则: 开盘止盈{TAKE_PROFIT*100:.1f}%，盘中止盈{INTRADAY_TAKE_PROFIT*100:.1f}%，{'不止损' if STOP_LOSS is None else f'止损{STOP_LOSS*100:.0f}%'}")
+    logger.info(f"当天涨幅过滤: T日[无下限, {FILTER_TODAY_DAY_RET * 100:.1f}%]区间外剔除")
+    logger.info(
+        f"卖出规则: 开盘止盈{TAKE_PROFIT * 100:.1f}%，盘中止盈{INTRADAY_TAKE_PROFIT * 100:.1f}%，{'不止损' if STOP_LOSS is None else f'止损{STOP_LOSS * 100:.0f}%'}")
     logger.info(f"二次排序: Top{RERANK_CANDIDATES}候选→{RERANK_METHOD}综合排序→Top{TOP_N}")
 
     # ========== Step 1: 加载因子数据（基于训练文件的最新数据） ==========
@@ -95,7 +93,8 @@ def main():
         factor_data["date"] = pd.to_datetime(factor_data["date"])
         factor_data = factor_data.merge(low_df, on=["date", "code"], how="left")
         del low_parts, low_df
-        import gc; gc.collect()
+        import gc;
+        gc.collect()
         logger.info(f"low列补齐完成，缺失: {int(factor_data['low'].isna().sum())} 行")
 
     logger.info(f"因子数据: {len(factor_data)} 行, {factor_data['code'].nunique()} 只股票")
@@ -148,11 +147,11 @@ def main():
         horizons=available_horizons,
         start_date=start_dt,
         end_date=None,
-        take_profit=TAKE_PROFIT,  # 开盘止盈0.5%
+        take_profit=TAKE_PROFIT,  # 开盘止盈1.5%
         stop_loss=STOP_LOSS,  # 不止损
-        filter_today_day_ret=FILTER_TODAY_DAY_RET,  # T日日涨幅>9.5%剔除
-        filter_today_day_ret_min=FILTER_TODAY_DAY_RET_MIN,  # T日日涨幅<-3%剔除
-        intraday_take_profit=INTRADAY_TAKE_PROFIT,  # 盘中最高价涨4.5%止盈
+        filter_today_day_ret=FILTER_TODAY_DAY_RET,  # T日日涨幅>9.0%剔除
+        filter_today_day_ret_min=FILTER_TODAY_DAY_RET_MIN,  # 不设下限
+        intraday_take_profit=INTRADAY_TAKE_PROFIT,  # 盘中最高价涨4.0%止盈
         rerank_candidates=RERANK_CANDIDATES,
         rerank_method=RERANK_METHOD,
         rerank_weights=RERANK_WEIGHTS,

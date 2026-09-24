@@ -134,6 +134,24 @@ def compute_factors_single(df: pd.DataFrame) -> pd.DataFrame:
     df["trend_strength_20d"] = safe_div(close - close.rolling(20).min(),
                                         close.rolling(20).max() - close.rolling(20).min())
 
+    # ===== 资金流代理因子（baostock无真实资金流数据，用量价关系构造） =====
+    # 1. 资金净流入代理：涨且放量=资金流入，跌且放量=资金流出
+    df["mf_net_proxy"] = np.sign(df["ret_1d"]) * df["amount_ratio"]
+
+    # 2. 日内资金流向：收盘在日内区间的位置 × 成交额（收高=买方强势）
+    hl_range = high - low
+    df["mf_intraday"] = safe_div(close - low, hl_range.replace(0, np.nan)) * amount
+
+    # 3. 量价背离：涨但缩量=假突破风险（正值=量价配合好，负值=背离）
+    df["vol_price_div"] = df["ret_1d"] * df["vol_ratio_5"]
+
+    # 4. OBV代理：累计(sign(涨跌) × 成交量)
+    obv = (np.sign(df["log_ret_1d"]) * volume).cumsum()
+    df["obv_ma5_ratio"] = safe_div(obv, obv.rolling(5).mean())
+
+    # 5. 上攻力度：(close-open)/open × 量比（实体涨幅 × 放量程度）
+    df["buying_strength"] = safe_div(close - open_, open_) * df["vol_ratio_5"]
+
     return df
 
 
@@ -200,8 +218,21 @@ def compute_factors(all_data: pd.DataFrame) -> tuple:
 
     # 识别因子列（ret_1d_raw保留原始收益率不标准化，用于涨停判断）
     result["ret_1d_raw"] = result["ret_1d"]
-    factor_cols = [c for c in result.columns if c not in ["date", "code", "open", "high", "low", "close", "ret_1d_raw", "high_low_ratio"]]
+    factor_cols = [c for c in result.columns if
+                   c not in ["date", "code", "open", "high", "low", "close", "ret_1d_raw", "high_low_ratio"]]
     logger.info(f"共 {len(factor_cols)} 个因子，{len(result)} 行，进行横截面标准化...")
+
+    # 因子去冗余：相关性>0.95的因子只保留第一个（减少过拟合）
+    logger.info("因子去冗余：计算因子间相关性矩阵...")
+    corr_matrix = result[factor_cols].corr().abs()
+    upper = corr_matrix.where(np.triu(np.ones(corr_matrix.shape), k=1).astype(bool))
+    to_drop = [col for col in upper.columns if any(upper[col] > 0.95)]
+    if to_drop:
+        logger.info(f"剔除 {len(to_drop)} 个高相关冗余因子: {to_drop}")
+        factor_cols = [c for c in factor_cols if c not in to_drop]
+        result = result.drop(columns=to_drop, errors="ignore")
+    else:
+        logger.info("无高相关冗余因子")
 
     # 向量化横截面标准化：先算每日mean/std，再merge（比transform省内存）
     date_group = result.groupby("date")[factor_cols]
@@ -254,44 +285,40 @@ def compute_factors(all_data: pd.DataFrame) -> tuple:
     return result, factor_cols
 
 
-def create_labels(factor_data: pd.DataFrame, horizons: list = None) -> pd.DataFrame:
+def create_labels(factor_data: pd.DataFrame, horizons: list = None,
+                  take_profit: float = 0.005, intraday_take_profit: float = 0.045) -> pd.DataFrame:
     """
     创建标签：T日预测，T日尾盘买入，1天后卖出的收益率。
-    动态卖出：
-    -     - 1d_close: 动态卖出——T+1开盘高开≥2%则开盘价止盈，开盘低开≤-2%则开盘价止损，否则持有到T+1尾盘，收盘价跌超2%按-2%止损，否则收盘价卖出
-    优化目标=单位时间收益最大化（1天持仓，总收益即日均收益），直接在原数据上修改。
+    卖出逻辑与 backtest.py 完全一致：
+      1. T+1开盘高开≥take_profit → 开盘价止盈卖出
+      2. T+1盘中最高价≥intraday_take_profit → 按止盈价卖出
+      3. 否则 → T+1收盘价卖出（不止损）
+    默认参数与 backtest.py 当前写死值一致：开盘止盈0.5%，盘中止盈4.5%。
     """
     if horizons is None:
         horizons = ["1d_close"]
-    df = factor_data  # 不copy，直接修改
+    df = factor_data
 
-    # T日尾盘买入（用T日收盘价模拟尾盘价）
     buy_price = df["close"]
     g = df.groupby("code", sort=False)
 
-    # 预计算T+1开盘价和收盘价
+    # 预计算T+1开盘价、收盘价、最高价
     open_d1 = g["open"].shift(-1)
     close_d1 = g["close"].shift(-1)
+    high_d1 = g["high"].shift(-1)
 
     for mode in horizons:
-        # 1d_close 动态卖出
-        # 1. 开盘高开≥2% → 开盘价止盈
-        # 2. 开盘低开≤-2% → 开盘价止损（开盘已跌超止损线，按实际开盘价成交）
-        # 3. 否则持有到尾盘，收盘价跌超2%按-2%止损价卖出
         open_gap = open_d1 / buy_price - 1
-        take_profit_mask = open_gap >= 0.02  # 高开≥2%开盘止盈
-        open_stop_loss_mask = open_gap <= -0.02  # 低开≤-2%开盘止损
-        # 默认尾盘收盘价卖出
+        high_ret = high_d1 / buy_price - 1
+        # 默认收盘价卖出
         sell_price = close_d1.copy()
-        # 高开2%以上则开盘价止盈卖出
-        sell_price[take_profit_mask] = open_d1[take_profit_mask]
-        # 开盘跌超2%则开盘价止损卖出（按实际开盘价，不是止损价）
-        sell_price[open_stop_loss_mask] = open_d1[open_stop_loss_mask]
-        # 尾盘动态止损：收盘价跌超2%，按-2%止损价卖出（模拟止损单到价即成交）
-        close_stop_loss_mask = (~take_profit_mask) & (~open_stop_loss_mask) & (close_d1 / buy_price - 1 <= -0.02)
-        sell_price[close_stop_loss_mask] = buy_price[close_stop_loss_mask] * 0.98  # -2%止损价
+        # 1. 开盘止盈：高开≥0.5%按开盘价卖
+        tp_mask = open_gap >= take_profit
+        sell_price[tp_mask] = open_d1[tp_mask]
+        # 2. 盘中止盈：盘中最高价≥4.5%按4.5%卖（未被开盘止盈触发的情况下）
+        itp_mask = (~tp_mask) & (high_ret >= intraday_take_profit)
+        sell_price[itp_mask] = buy_price[itp_mask] * (1 + intraday_take_profit)
         total_ret = sell_price / buy_price - 1
-        # 1天持仓，总收益即日均收益，无需除以天数
         df[f"label_ret_{mode}"] = total_ret.astype("float32")
         df[f"label_abs_ret_{mode}"] = total_ret.astype("float32")
 
