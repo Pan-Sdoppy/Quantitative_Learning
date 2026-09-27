@@ -289,11 +289,14 @@ def create_labels(factor_data: pd.DataFrame, horizons: list = None,
                   take_profit: float = 0.005, intraday_take_profit: float = 0.045) -> pd.DataFrame:
     """
     创建标签：T日预测，T日尾盘买入，1天后卖出的收益率。
-    卖出逻辑与 backtest.py 完全一致：
+    标签卖出逻辑"结构"与 backtest.py 相同（开盘止盈→盘中止盈→收盘卖出，不止损）：
       1. T+1开盘高开≥take_profit → 开盘价止盈卖出
       2. T+1盘中最高价≥intraday_take_profit → 按止盈价卖出
       3. 否则 → T+1收盘价卖出（不止损）
-    默认参数与 backtest.py 当前写死值一致：开盘止盈0.5%，盘中止盈4.5%。
+    注意：标签默认参数(开盘0.5%/盘中4.5%)刻意与 backtest.py 兑现参数(开盘2%/盘中4%)不同。
+      - 标签服务"选股"：0.5%小阈值让模型聚焦识别"次日是否有上攻动能"，选股质量最高；
+      - 回测服务"兑现"：2%/4%是实际锁定收益的方式。
+      经严格对照重训：0.5%/4.5%标签在2%/4%回测下累计150.8亿；改成2%/4%标签后仅42亿，故保持默认。
     """
     if horizons is None:
         horizons = ["1d_close"]

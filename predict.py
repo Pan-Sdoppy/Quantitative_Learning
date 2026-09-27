@@ -36,6 +36,7 @@ INTRADAY_CACHE_FILE = Path(RAW_DIR) / "_intraday_last_update.json"
 INTRADAY_DATA_CACHE = Path(RAW_DIR) / "_intraday_cache.parquet"
 INTRADAY_MIN_INTERVAL = 0  # 盘中每次运行都获取最新实时数据，不缓存（0=不节流）
 MIN_STOCKS_PER_DAY = 1000  # 最新交易日最少股票数，避免盘中数据不完整
+MIN_PRED = 0.005  # 信号强度过滤：综合排序Top1预测次日收益<0.5%提示空仓（与backtest.py一致）
 
 
 def _disp_width(s: str) -> int:
@@ -420,8 +421,9 @@ def main():
     top = result.head(TOP_N).copy()
     top.index = range(1, len(top) + 1)
 
-    display_cols = ["code", "name", "close", "latest_pct_chg", "limit_status"]
-    display_names = ["股票代码", "股票名称", "收盘价", "最新涨跌幅", "状态"]
+    h0 = available_horizons[0]
+    display_cols = ["code", "name", "close", "latest_pct_chg", "limit_status", f"pred_ret_{h0}"]
+    display_names = ["股票代码", "股票名称", "收盘价", "最新涨跌幅", "状态", "pred"]
     # 所属板块放最后一列（排序仍按动态卖出置信度，仅不显示该列）
     display_cols.append("industry")
     display_names.append("所属板块")
@@ -437,6 +439,7 @@ def main():
         display["动态卖出置信度"] = display["动态卖出置信度"].round(4)
     # 涨跌幅显示为百分比
     display["最新涨跌幅"] = (display["最新涨跌幅"] * 100).round(2).astype(str) + "%"
+    display["pred"] = display["pred"].round(4)  # pred=预测次日收益率，保留4位小数
 
     print("\n" + "=" * 100)
     buy_strategy = "今日尾盘买入" if use_intraday else "下一交易日尾盘买入"
@@ -479,17 +482,24 @@ def main():
         candidates["综合排序分"] = score
         candidates = candidates.sort_values("综合排序分")
         rerank_desc = "7因子手工重排"
-        rerank_display = candidates[["code", "name", "close", "latest_pct_chg", "industry", conf_col]].copy()
+        rerank_display = candidates[["code", "name", "close", "latest_pct_chg", "pred", "industry"]].copy()
         rerank_display.insert(0, "排名", range(1, len(rerank_display) + 1))
-        rerank_display.columns = ["排名", "股票代码", "股票名称", "收盘价", "当天涨幅", "所属板块", "模型置信度"]
+        rerank_display.columns = ["排名", "股票代码", "股票名称", "收盘价", "当天涨幅", "pred", "所属板块"]
         rerank_display["收盘价"] = rerank_display["收盘价"].round(2)
         rerank_display["当天涨幅"] = (rerank_display["当天涨幅"] * 100).round(2).astype(str) + "%"
-        rerank_display["模型置信度"] = rerank_display["模型置信度"].round(4)
+        rerank_display["pred"] = rerank_display["pred"].map(lambda x: f"{x:.4f}")  # 统一4位小数对齐
         print()
         print("=" * 100)
         print(f"综合排序Top10（模型粗筛Top10→{rerank_desc}）")
         print("=" * 100)
         print_table(rerank_display)
+        top1_pred = float(candidates["pred"].iloc[0])
+        if top1_pred < MIN_PRED:
+            print(
+                f"  [弱信号-建议空仓] 综合排序Top1预测次日收益仅 {top1_pred * 100:.2f}%(<{MIN_PRED * 100:.1f}%)，历史弱信号胜率约58%，当日不买入")
+        else:
+            print(
+                f"  [信号有效-可买入] 综合排序Top1预测次日收益 {top1_pred * 100:.2f}%(>={MIN_PRED * 100:.1f}%)，可尾盘买入")
         print("=" * 100)
     except Exception as e:
         logger.warning(f"综合排序打印失败（已跳过）: {e}")
@@ -504,14 +514,16 @@ def main():
             excel_path.parent.mkdir(parents=True, exist_ok=True)
             sheet_name = latest_date.strftime("%Y-%m-%d")
 
-            excel_cols = ["code", "name", "close", "latest_pct_chg", "limit_status", "industry",
+            excel_cols = ["code", "name", "close", "latest_pct_chg", "limit_status",
+                          f"pred_ret_{available_horizons[0]}", "industry",
                           f"confidence_{available_horizons[0]}"]
             excel_df = result[excel_cols].copy()
             excel_df.insert(0, "排名", range(1, len(excel_df) + 1))
-            excel_df.columns = ["排名", "股票代码", "股票名称", "收盘价", "当天涨幅", "状态", "所属板块",
+            excel_df.columns = ["排名", "股票代码", "股票名称", "收盘价", "当天涨幅", "状态", "pred", "所属板块",
                                 "动态卖出置信度"]
             excel_df["收盘价"] = excel_df["收盘价"].round(2)
             excel_df["当天涨幅"] = (excel_df["当天涨幅"] * 100).round(2).map(lambda x: f"{x:.2f}%")
+            excel_df["pred"] = excel_df["pred"].round(4)  # pred=预测次日收益率，4位小数
 
             file_exists = excel_path.exists()
             excel_mode = "a" if file_exists else "w"
@@ -526,6 +538,9 @@ def main():
                 for cell in ws["D"]:
                     if cell.row > 1 and cell.value is not None:
                         cell.number_format = "0.00"
+                for cell in ws["G"]:
+                    if cell.row > 1 and cell.value is not None:
+                        cell.number_format = "0.0000"
                 for col_idx, col in enumerate(ws.columns, 1):
                     max_len = 0
                     for cell in col:
@@ -533,6 +548,8 @@ def main():
                             # D列(收盘价)按两位小数显示格式计算宽度
                             if col_idx == 4 and cell.row > 1:
                                 v = f"{cell.value:.2f}"
+                            elif col_idx == 7 and cell.row > 1:
+                                v = f"{cell.value:.4f}"
                             else:
                                 v = str(cell.value)
                             w = sum(2 if ord(ch) > 127 else 1 for ch in v)

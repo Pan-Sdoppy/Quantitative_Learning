@@ -299,6 +299,8 @@ def _process_one_stock(code: str, name: str, start_date: str, today: str,
                 return "skip"
             # 合并
             existing = pd.read_parquet(file_path)
+            existing["date"] = pd.to_datetime(existing["date"], errors="coerce")
+            new_data["date"] = pd.to_datetime(new_data["date"], errors="coerce")
             combined = pd.concat([existing, new_data], ignore_index=True)
             combined = combined.drop_duplicates(subset=["date"], keep="last")
             combined = combined.sort_values("date").reset_index(drop=True)

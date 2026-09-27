@@ -456,8 +456,8 @@ class MLPModel:
 class EnsembleModel:
     """LightGBM + XGBoost + MLP 三模型加权集成"""
 
-    def __init__(self, horizon: int, lgb_weight: float = 0.35,
-                 xgb_weight: float = 0.35, mlp_weight: float = 0.30):
+    def __init__(self, horizon: int, lgb_weight: float = 0.40,
+                 xgb_weight: float = 0.40, mlp_weight: float = 0.20):
         self.horizon = horizon
         self.lgb_weight = lgb_weight
         self.xgb_weight = xgb_weight

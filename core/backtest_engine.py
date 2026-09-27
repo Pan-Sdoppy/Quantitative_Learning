@@ -45,7 +45,9 @@ def run_backtest(factor_data: pd.DataFrame, models: dict,
                  filter_vol_ratio_max: float = None,
                  rerank_candidates: int = None,
                  rerank_method: str = None,
-                 rerank_weights: list = None) -> dict:
+                 rerank_weights: list = None,
+                 min_pred: float = None,
+                 index_5d_empty: float = None) -> dict:
     """运行动态卖出回测（1d_close）
     take_profit: 高开止盈阈值（如0.02=高开2%开盘卖），None=无止盈
     stop_loss: 止损阈值（如-0.02=跌2%止损），None=不止损
@@ -124,7 +126,9 @@ def run_backtest(factor_data: pd.DataFrame, models: dict,
                                     filter_vol_ratio_max,
                                     rerank_candidates,
                                     rerank_method,
-                                    rerank_weights)
+                                    rerank_weights,
+                                    min_pred,
+                                    index_5d_empty)
         results[h] = res
         _print_metrics(h, res["metrics"], take_profit, stop_loss)
 
@@ -150,7 +154,9 @@ def _backtest_single_mode(factor_data: pd.DataFrame, model, mode: str, top_n: in
                           filter_vol_ratio_max: float = None,
                           rerank_candidates: int = None,
                           rerank_method: str = None,
-                          rerank_weights: list = None) -> dict:
+                          rerank_weights: list = None,
+                          min_pred: float = None,
+                          index_5d_empty: float = None) -> dict:
     """单模式回测（1d_close 动态止盈+止损）
     take_profit: 高开止盈阈值（如0.02=高开2%开盘卖），None=无止盈
     stop_loss: 止损阈值（如-0.02=跌2%止损），None=不止损
@@ -255,6 +261,12 @@ def _backtest_single_mode(factor_data: pd.DataFrame, model, mode: str, top_n: in
         if skip_if_index_down and "hs300_ret_1d" in day_data.columns:
             idx_ret = day_data["hs300_ret_1d"].iloc[0]
             if idx_ret < 0:
+                skipped_empty += 1
+                equity_points.append({"date": rebal_date, "equity": equity})
+                continue
+        # 大盘5日收益低于阈值则空仓（市场状态过滤，None=不启用）
+        if index_5d_empty is not None and "hs300_ret_5d" in day_data.columns:
+            if day_data["hs300_ret_5d"].iloc[0] < index_5d_empty:
                 skipped_empty += 1
                 equity_points.append({"date": rebal_date, "equity": equity})
                 continue
@@ -387,6 +399,11 @@ def _backtest_single_mode(factor_data: pd.DataFrame, model, mode: str, top_n: in
             selected = day_data.nlargest(top_n, "pred")
         selected_codes = selected["code"].tolist()
         selected_preds = selected["pred"].tolist()
+        # 信号强度过滤：Top1预测收益率低于min_pred则空仓（弱信号胜率显著低，回测验证可提升夏普/降低回撤）
+        if min_pred is not None and selected_preds and selected_preds[0] < min_pred:
+            skipped_empty += 1
+            equity_points.append({"date": rebal_date, "equity": equity})
+            continue
         if weights is not None:
             weights = list(weights)[:top_n] + [0.0] * max(0, top_n - len(weights))
         elif top_n == 3:
