@@ -37,6 +37,11 @@ INTRADAY_DATA_CACHE = Path(RAW_DIR) / "_intraday_cache.parquet"
 INTRADAY_MIN_INTERVAL = 0  # 盘中每次运行都获取最新实时数据，不缓存（0=不节流）
 MIN_STOCKS_PER_DAY = 1000  # 最新交易日最少股票数，避免盘中数据不完整
 MIN_PRED = 0.005  # 信号强度过滤：综合排序Top1预测次日收益<0.5%提示空仓（与backtest.py一致）
+# 分段动态开盘止盈（与backtest.py一致）：pred<1%开盘止盈1.5%、pred≥1%开盘止盈3%，盘中止盈4%
+DYN_TP_BOUNDARY = 0.01
+DYN_TP_LOW = 0.015
+DYN_TP_HIGH = 0.03
+INTRADAY_TP = 0.04
 
 
 def _disp_width(s: str) -> int:
@@ -265,7 +270,7 @@ def build_market_advice(latest_factor_data: pd.DataFrame) -> str:
         return ""
 
 
-def main():
+def main(pred_=["排名", "股票代码", "股票名称", "收盘价", "当天涨幅", "pred", "所属板块"]):
     now = datetime.now()
     logger.info("=" * 70)
     logger.info("A股量化预测开始")
@@ -484,7 +489,7 @@ def main():
         rerank_desc = "7因子手工重排"
         rerank_display = candidates[["code", "name", "close", "latest_pct_chg", "pred", "industry"]].copy()
         rerank_display.insert(0, "排名", range(1, len(rerank_display) + 1))
-        rerank_display.columns = ["排名", "股票代码", "股票名称", "收盘价", "当天涨幅", "pred", "所属板块"]
+        rerank_display.columns = pred_
         rerank_display["收盘价"] = rerank_display["收盘价"].round(2)
         rerank_display["当天涨幅"] = (rerank_display["当天涨幅"] * 100).round(2).astype(str) + "%"
         rerank_display["pred"] = rerank_display["pred"].map(lambda x: f"{x:.4f}")  # 统一4位小数对齐
@@ -500,6 +505,9 @@ def main():
         else:
             print(
                 f"  [信号有效-可买入] 综合排序Top1预测次日收益 {top1_pred * 100:.2f}%(>={MIN_PRED * 100:.1f}%)，可尾盘买入")
+            _tp = DYN_TP_LOW if top1_pred < DYN_TP_BOUNDARY else DYN_TP_HIGH
+            print(
+                f"  [次日卖出] 开盘止盈{_tp * 100:.1f}%(pred{"<" if top1_pred < DYN_TP_BOUNDARY else "≥"}1%)，盘中止盈{INTRADAY_TP * 100:.0f}%，均未触及则收盘卖出，不止损")
         print("=" * 100)
     except Exception as e:
         logger.warning(f"综合排序打印失败（已跳过）: {e}")

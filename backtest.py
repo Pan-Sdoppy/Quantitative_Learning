@@ -36,6 +36,9 @@ FILTER_TODAY_DAY_RET_MIN = None  # 不设下限（网格搜索最优：无下限
 TAKE_PROFIT = 0.020  # 开盘止盈2.0%（网格搜索：2026年收益最优1521%，回撤不变）
 STOP_LOSS = None  # 不止损（回测最优：-5%太紧会被洗盘甩出，不设止损收益最高）
 INTRADAY_TAKE_PROFIT = 0.040  # 盘中最高价涨4.0%止盈（网格搜索最优）
+# 分段动态开盘止盈（按当日Top1 pred）：pred<1%用1.5%、pred≥1%用3%（回测+9.4%，2024/25/26三年一致）
+# tuple=(pred分界, 弱信号tp, 强信号tp)；启用后 TAKE_PROFIT 仅作回退基准
+DYNAMIC_TP = (0.01, 0.015, 0.03)
 # 二次排序：模型粗筛Top10后，按综合规则（振幅小+量比低+跳空高）重排选Top3
 # 回测验证：收益从4387万%提升到12073万%（2.75倍），胜率77.86%→81.68%
 RERANK_CANDIDATES = 10
@@ -55,7 +58,7 @@ def main():
     logger.info(f"配置: 每次买{TOP_N}只, 1天持仓动态卖出={HORIZONS}, 模型={BACKTEST_TAG}")
     logger.info(f"当天涨幅过滤: T日[无下限, {FILTER_TODAY_DAY_RET * 100:.1f}%]区间外剔除")
     logger.info(
-        f"卖出规则: 开盘止盈{TAKE_PROFIT * 100:.1f}%，盘中止盈{INTRADAY_TAKE_PROFIT * 100:.1f}%，{'不止损' if STOP_LOSS is None else f'止损{STOP_LOSS * 100:.0f}%'}")
+        f"开盘止盈(动态): pred<1%为1.5%、pred≥1%为3%；盘中止盈{INTRADAY_TAKE_PROFIT * 100:.1f}%，{'不止损' if STOP_LOSS is None else f'止损{STOP_LOSS * 100:.0f}%'}")
     logger.info(f"二次排序: Top{RERANK_CANDIDATES}候选→{RERANK_METHOD}综合排序→Top{TOP_N}")
 
     # ========== Step 1: 加载因子数据（基于训练文件的最新数据） ==========
@@ -160,6 +163,7 @@ def main():
         rerank_method=RERANK_METHOD,
         rerank_weights=RERANK_WEIGHTS,
         min_pred=MIN_PRED,  # Top1预测收益率<0.5%空仓
+        dynamic_tp=DYNAMIC_TP,  # 按pred分段动态开盘止盈
     )
 
     # ========== Step 4: 保存结果 ==========

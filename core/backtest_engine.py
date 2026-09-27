@@ -47,7 +47,8 @@ def run_backtest(factor_data: pd.DataFrame, models: dict,
                  rerank_method: str = None,
                  rerank_weights: list = None,
                  min_pred: float = None,
-                 index_5d_empty: float = None) -> dict:
+                 index_5d_empty: float = None,
+                 dynamic_tp: tuple = None) -> dict:
     """运行动态卖出回测（1d_close）
     take_profit: 高开止盈阈值（如0.02=高开2%开盘卖），None=无止盈
     stop_loss: 止损阈值（如-0.02=跌2%止损），None=不止损
@@ -128,7 +129,8 @@ def run_backtest(factor_data: pd.DataFrame, models: dict,
                                     rerank_method,
                                     rerank_weights,
                                     min_pred,
-                                    index_5d_empty)
+                                    index_5d_empty,
+                                    dynamic_tp)
         results[h] = res
         _print_metrics(h, res["metrics"], take_profit, stop_loss)
 
@@ -156,7 +158,8 @@ def _backtest_single_mode(factor_data: pd.DataFrame, model, mode: str, top_n: in
                           rerank_method: str = None,
                           rerank_weights: list = None,
                           min_pred: float = None,
-                          index_5d_empty: float = None) -> dict:
+                          index_5d_empty: float = None,
+                          dynamic_tp: tuple = None) -> dict:
     """单模式回测（1d_close 动态止盈+止损）
     take_profit: 高开止盈阈值（如0.02=高开2%开盘卖），None=无止盈
     stop_loss: 止损阈值（如-0.02=跌2%止损），None=不止损
@@ -404,6 +407,11 @@ def _backtest_single_mode(factor_data: pd.DataFrame, model, mode: str, top_n: in
             skipped_empty += 1
             equity_points.append({"date": rebal_date, "equity": equity})
             continue
+        # 分段动态开盘止盈：按当日Top1 pred选tp（弱信号小赚快跑、强信号给上涨空间）
+        tp_eff = take_profit
+        if dynamic_tp is not None and selected_preds:
+            _tp_bnd, _tp_lo, _tp_hi = dynamic_tp
+            tp_eff = _tp_lo if selected_preds[0] < _tp_bnd else _tp_hi
         if weights is not None:
             weights = list(weights)[:top_n] + [0.0] * max(0, top_n - len(weights))
         elif top_n == 3:
@@ -450,8 +458,8 @@ def _backtest_single_mode(factor_data: pd.DataFrame, model, mode: str, top_n: in
             sell_price = None
             if not pd.isna(open_d1):
                 open_gap = open_d1 / buy_price - 1
-                if take_profit and open_gap >= take_profit:
-                    # 高开达到止盈阈值，开盘价止盈卖出
+                if tp_eff and open_gap >= tp_eff:
+                    # 高开达到当日动态止盈阈值，开盘价止盈卖出
                     sell_price = open_d1
                     is_stop_loss = False  # 止盈，非止损
                 elif stop_loss and open_gap <= stop_loss:
