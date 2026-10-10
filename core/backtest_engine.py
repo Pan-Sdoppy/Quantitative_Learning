@@ -10,10 +10,33 @@
 - 输出回测报告与净值曲线
 """
 import numpy as np
+import os
 import pandas as pd
+from collections import deque
 from tqdm import tqdm
 
 from .utils import RESULT_DIR, get_logger
+
+# === 连续上榜优先加分（实验开关，默认0=关闭，不影响基线）===
+# 模型粗筛Top10候选中，若某股连续N天都在Top10候选里，则composite score加 STREAK_BONUS*连续天数
+STREAK_BONUS = 2.0  # 连续上榜加分系数（网格搜索最优：N=2,bonus=2.0，收益+10.8%）
+STREAK_WINDOW = 2  # 连续上榜参考天数
+# === K线形态+位置因子实验开关（默认全0=关闭，不影响基线）===
+KLINE_SHADOW_W = 1.0   # 上影线短加分权重（网格搜索最优：shadow=1.0,kflag=0.5，收益+93.1%）
+KLINE_KFLAG_W = 0.5    # 光头阳加分/光头阴减分权重（半权重最优，全权重扭曲排序）
+KLINE_BODY_W = 0.0     # 实体强度：叠加后负向/无增益，保持关闭
+KLINE_HIGH20_W = 0.0   # 20日高位回避：负向(-11%)，保持关闭
+
+# === 日内形态因子（已写死，回测验证正向）===
+OPEN_POS_W = 2.0    # 开盘价位置低优先(低开好)：回测验证+4.1%收益、回撤-16.65%→-12.64%
+BODY_STR_W = 1.0    # 实体强度低优先(十字星好)：与开盘价位置组合互补正向
+STREAK_UP_W = 1.0  # 连续上涨天数高优先（连涨多=强势延续，回测验证+13.4%收益、胜率85.83%→86.48%）
+
+# === 板块涨停集中度因子（实验开关，默认0=关闭，不影响基线）===
+# 候选股所属板块当天涨停数量越多→越靠前（涨停集中板块强势，其所属可买个股次日有望补涨）
+# 需行业归属表 data/raw/_stock_industry.csv，仅当权重>0时才加载行业并计算
+SECTOR_LIMITUP_W = float(os.environ.get("SECTOR_LIMITUP_W", "0"))
+
 
 logger = get_logger("backtest")
 
@@ -74,6 +97,23 @@ def run_backtest(factor_data: pd.DataFrame, models: dict,
 
     factor_data = factor_data.copy()
     factor_data["date"] = pd.to_datetime(factor_data["date"])
+
+    # 板块涨停集中度因子：仅在启用时加载行业归属并合并（默认不加载，不影响基线内存/性能）
+    if SECTOR_LIMITUP_W > 0:
+        from pathlib import Path
+        industry_path = Path(__file__).parent.parent / "data" / "raw" / "_stock_industry.csv"
+        try:
+            ind_df = pd.read_csv(industry_path, usecols=["code", "industry"])
+            ind_df["code"] = ind_df["code"].astype(str).str.zfill(6)
+            ind_df = ind_df[["code", "industry"]].drop_duplicates("code")
+            factor_data["code"] = factor_data["code"].astype(str).str.zfill(6)
+            factor_data = factor_data.merge(ind_df, on="code", how="left")
+            factor_data["industry"] = factor_data["industry"].fillna("")
+            del ind_df
+            logger.info(f"板块涨停集中度因子启用：行业归属加载完成")
+        except Exception as _e:
+            logger.warning(f"行业归属加载失败，板块涨停因子不生效: {_e}")
+
     if start_date:
         factor_data = factor_data[factor_data["date"] >= pd.Timestamp(start_date)]
     if end_date:
@@ -247,6 +287,7 @@ def _backtest_single_mode(factor_data: pd.DataFrame, model, mode: str, top_n: in
 
     pbar_desc = "回测 动态卖出"
 
+    recent_top10 = deque(maxlen=STREAK_WINDOW)  # 连续上榜实验
     for rebal_date in tqdm(rebalance_dates, desc=pbar_desc, ncols=100):
         day_data = factor_data[factor_data["date"] == rebal_date].copy()
         if len(day_data) < top_n:
@@ -273,6 +314,11 @@ def _backtest_single_mode(factor_data: pd.DataFrame, model, mode: str, top_n: in
                 skipped_empty += 1
                 equity_points.append({"date": rebal_date, "equity": equity})
                 continue
+
+        # 板块涨停集中度：计算当天每个板块涨停股票数（涨停集中板块→强势）
+        if SECTOR_LIMITUP_W > 0 and "industry" in day_data.columns and "ret_1d_raw" in day_data.columns:
+            _lim_mask = day_data["ret_1d_raw"] >= LIMIT_UP_THRESHOLD
+            day_data["sector_limitup_cnt"] = day_data.loc[_lim_mask].groupby("industry")["code"].transform("count").fillna(0)
 
         X = day_data[feature_cols].values
         preds = model.predict(X)
@@ -330,6 +376,7 @@ def _backtest_single_mode(factor_data: pd.DataFrame, model, mode: str, top_n: in
             skipped_filter += before - len(day_data)
             if len(day_data) < before:
                 logger.debug(f"  {rebal_date:%Y-%m-%d}: 阴线过滤剔除{before - len(day_data)}只")
+
 
         # 剔除流通市值过小的小票
         if filter_min_mv is not None and "_mv_yi" in day_data.columns:
@@ -396,17 +443,65 @@ def _backtest_single_mode(factor_data: pd.DataFrame, model, mode: str, top_n: in
                     score -= w[5] * candidates["close_position_5d"].rank(ascending=True)
                 if "ret_3d" in candidates.columns:
                     score -= w[6] * candidates["ret_3d"].rank(ascending=True)
+                # === K线形态+位置因子（实验：上影线短/光头形态/实体强度/20日高位回避）===
+                if (KLINE_SHADOW_W or KLINE_KFLAG_W or KLINE_BODY_W or KLINE_HIGH20_W) and {'open','high','low','close'}.issubset(candidates.columns):
+                    _eps = 1e-9
+                    _rng = (candidates['high'] - candidates['low']).clip(lower=_eps)
+                    _upper = (candidates['high'] - np.maximum(candidates['open'], candidates['close'])) / _rng
+                    _body = (candidates['close'] - candidates['open']).abs() / _rng
+                    _bull = ((candidates['close'] >= candidates['high'] - 0.01 * _rng) & (candidates['close'] > candidates['open']))
+                    _bear = ((candidates['close'] <= candidates['low'] + 0.01 * _rng) & (candidates['close'] < candidates['open']))
+                    if KLINE_SHADOW_W:
+                        score += KLINE_SHADOW_W * _upper.rank(ascending=True)  # 上影线短→rank小→靠前
+                    if KLINE_KFLAG_W:
+                        _morph = _bull.astype(int) - _bear.astype(int)
+                        score -= KLINE_KFLAG_W * _morph.rank(ascending=True)   # 光头阳(+1)→rank大→靠前；光头阴(-1)→靠后
+                    if KLINE_BODY_W:
+                        score -= KLINE_BODY_W * _body.rank(ascending=True)     # 实体大→rank大→靠前
+                    if KLINE_HIGH20_W and 'ret_20d' in candidates.columns:
+                        score += KLINE_HIGH20_W * candidates['ret_20d'].rank(ascending=True)  # 20日涨幅高→rank大→靠后（回避高位）
+                # === 开盘价位置因子（低开好：open在日内低位）===
+                if OPEN_POS_W > 0 and {'open','high','low'}.issubset(candidates.columns):
+                    _r = (candidates['high'] - candidates['low']).clip(lower=1e-9)
+                    _open_pos = (candidates['open'] - candidates['low']) / _r
+                    score += OPEN_POS_W * _open_pos.rank(ascending=True)
+                # === 实体强度因子（十字星好：实体小=多空平衡）===
+                if BODY_STR_W > 0 and {'open','high','low','close'}.issubset(candidates.columns):
+                    _r = (candidates['high'] - candidates['low']).clip(lower=1e-9)
+                    _body = (candidates['close'] - candidates['open']).abs() / _r
+                    score += BODY_STR_W * _body.rank(ascending=True)
+                # === 连续上涨天数因子（连涨多=强势延续，高优先）===
+                if STREAK_UP_W > 0 and "streak_up" in candidates.columns:
+                    score -= STREAK_UP_W * candidates["streak_up"].rank(ascending=True)
+                # === 板块涨停集中度因子（涨停集中板块强势，其所属可买个股高优先）===
+                if SECTOR_LIMITUP_W > 0 and "sector_limitup_cnt" in candidates.columns:
+                    score -= SECTOR_LIMITUP_W * candidates["sector_limitup_cnt"].rank(ascending=True)
+                # === 连续上榜优先加分（实验）===
+                if STREAK_BONUS > 0 and len(recent_top10) > 0:
+                    for _idx, _code in candidates["code"].items():
+                        _streak = 0
+                        for _past in reversed(recent_top10):
+                            if _code in _past:
+                                _streak += 1
+                            else:
+                                break
+                        if _streak >= 1:
+                            score.at[_idx] += STREAK_BONUS * _streak
                 candidates = candidates.assign(_rerank_score=score).sort_values("_rerank_score")
             selected = candidates.head(top_n)
         else:
             selected = day_data.nlargest(top_n, "pred")
         selected_codes = selected["code"].tolist()
         selected_preds = selected["pred"].tolist()
+        # 连续上榜实验：记录当天模型粗筛Top10候选
+        if rerank_candidates is not None:
+            recent_top10.append(set(candidates["code"].tolist()))
         # 信号强度过滤：Top1预测收益率低于min_pred则空仓（弱信号胜率显著低，回测验证可提升夏普/降低回撤）
-        if min_pred is not None and selected_preds and selected_preds[0] < min_pred:
-            skipped_empty += 1
-            equity_points.append({"date": rebal_date, "equity": equity})
-            continue
+        if min_pred is not None and selected_preds:
+            if selected_preds[0] < min_pred:
+                skipped_empty += 1
+                equity_points.append({"date": rebal_date, "equity": equity})
+                continue
         # 分段动态开盘止盈：按当日Top1 pred选tp（弱信号小赚快跑、强信号给上涨空间）
         tp_eff = take_profit
         if dynamic_tp is not None and selected_preds:

@@ -247,15 +247,18 @@ def _download_single(code: str, start_date: str, end_date: str, retries: int = 2
             df["pct_chg"] = df["close"].pct_change() * 100
             df = df.rename(columns={"turn": "turnover"})
             # 硬校验：相邻交易日涨跌幅超过±20%说明baostock返回了串行/残留数据，丢弃
-            # 新股（不足20个交易日）不设涨跌幅限制，跳过校验
-            if len(df) >= 2 and len(df) > 20:
-                max_jump = df["close"].pct_change().abs().max()
-                if max_jump > 0.20:
-                    logger.warning(f"股票 {code}({symbol}) 数据异常(单日跳空{max_jump * 100:.1f}%)，可能串行，丢弃重试")
-                    if attempt < retries - 1:
-                        time.sleep(1)
-                        continue
-                    return pd.DataFrame()
+            # 次新股上市初期（前60个交易日）不设涨跌幅/波动大，跳过校验（与次新股过滤口径一致）
+            # 增量下载时df行数少自然跳过；全量下载时排除前60行
+            if len(df) > 60:
+                check_df = df.iloc[60:]
+                if len(check_df) >= 2:
+                    max_jump = check_df["close"].pct_change().abs().max()
+                    if max_jump > 0.20:
+                        logger.warning(f"股票 {code}({symbol}) 数据异常(单日跳空{max_jump * 100:.1f}%)，可能串行，丢弃重试")
+                        if attempt < retries - 1:
+                            time.sleep(1)
+                            continue
+                        return pd.DataFrame()
             return df
         except Exception as e:
             if attempt < retries - 1:

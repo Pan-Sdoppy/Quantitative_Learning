@@ -458,7 +458,33 @@ def main(pred_=["排名", "股票代码", "股票名称", "收盘价", "当天�
     print_table(display.head(4000))  # 终端只打印前50，完整结果存CSV
     print("=" * 100)
 
-    # ========== 综合排序Top10（二次排序：模型粗筛Top10→7因子手工composite重排） ==========
+    # === 连续上榜优先加分：计算过去N天模型Top10候选（与回测一致，N=2,bonus=2.0）===
+    STREAK_WINDOW = 2
+    STREAK_BONUS = 2.0
+    recent_top10 = []
+    try:
+        all_dates = sorted(factor_data["date"].unique())
+        latest_pos = all_dates.index(latest_date) if latest_date in all_dates else len(all_dates) - 1
+        hist_dates = all_dates[max(0, latest_pos - STREAK_WINDOW):latest_pos]
+        _h0 = available_horizons[0]
+        for _hd in hist_dates:
+            _hday = factor_data[factor_data["date"] == _hd].copy()
+            if len(_hday) < 10:
+                continue
+            if "ret_1d_raw" in _hday.columns:
+                _hday = _hday[(_hday["ret_1d_raw"] < 0.095) & (_hday["ret_1d_raw"] <= 0.090)]
+            if len(_hday) < 10:
+                continue
+            _hpred = models[_h0].predict(_hday[factor_cols])
+            _hday = _hday.assign(_pred=_hpred)
+            _top10 = set(_hday.nlargest(10, "_pred")["code"].astype(str).str.zfill(6).tolist())
+            recent_top10.append(_top10)
+        logger.info(f"连续上榜参考: 过去{len(recent_top10)}天Top10候选已计算")
+    except Exception as _e:
+        logger.warning(f"连续上榜历史Top10计算失败({_e})，跳过加分")
+        recent_top10 = []
+
+    # ========== 综合排序Top10（二次排序：模型粗筛Top10→7因子手工composite重排+连续上榜加分） ==========
     try:
         buyable = result[~result["is_limit_up"]].copy()
         buyable = buyable[buyable["latest_pct_chg"] <= 0.090]  # 涨幅过滤：无下限，上限9.0%（网格搜索最优）
@@ -484,6 +510,38 @@ def main(pred_=["排名", "股票代码", "股票名称", "收盘价", "当天�
             score -= 1 * candidates["close_position_5d"].rank(ascending=True)
         if "ret_3d" in candidates.columns:
             score -= 1 * candidates["ret_3d"].rank(ascending=True)
+        # === K线形态因子（与回测一致：上影线短w=1.0，光头阳加/光头阴减w=0.5）===
+        if {'open', 'high', 'low', 'close'}.issubset(candidates.columns):
+            _eps = 1e-9
+            _rng = (candidates['high'] - candidates['low']).clip(lower=_eps)
+            _upper = (candidates['high'] - np.maximum(candidates['open'], candidates['close'])) / _rng
+            _bull = ((candidates['close'] >= candidates['high'] - 0.01 * _rng) & (candidates['close'] > candidates['open']))
+            _bear = ((candidates['close'] <= candidates['low'] + 0.01 * _rng) & (candidates['close'] < candidates['open']))
+            score += 1.0 * _upper.rank(ascending=True)  # 上影线短→rank小→靠前
+            _morph = _bull.astype(int) - _bear.astype(int)
+            score -= 0.5 * _morph.rank(ascending=True)  # 光头阳(+1)→靠前；光头阴(-1)→靠后
+        # === 日内形态因子（与回测一致：开盘价位置低优先w=2.0，实体强度低优先w=1.0）===
+        if {'open', 'high', 'low', 'close'}.issubset(candidates.columns):
+            _eps = 1e-9
+            _rng = (candidates['high'] - candidates['low']).clip(lower=_eps)
+            _open_pos = (candidates['open'] - candidates['low']) / _rng
+            score += 2.0 * _open_pos.rank(ascending=True)  # 低开→rank小→靠前
+            _body = (candidates['close'] - candidates['open']).abs() / _rng
+            score += 1.0 * _body.rank(ascending=True)  # 十字星→rank小→靠前
+        # === 连续上涨天数因子（与回测一致：连涨多=强势延续，w=1.0）===
+        if "streak_up" in candidates.columns:
+            score -= 1.0 * candidates["streak_up"].rank(ascending=True)  # 连涨多→rank大→靠前
+        # 连续上榜加分：连续N天在Top10候选里的股票加 STREAK_BONUS*连续天数
+        if recent_top10:
+            for _idx, _code in candidates["code"].items():
+                _streak = 0
+                for _past in reversed(recent_top10):
+                    if _code in _past:
+                        _streak += 1
+                    else:
+                        break
+                if _streak >= 1:
+                    score.at[_idx] += STREAK_BONUS * _streak
         candidates["综合排序分"] = score
         candidates = candidates.sort_values("综合排序分")
         rerank_desc = "7因子手工重排"

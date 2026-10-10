@@ -33,12 +33,18 @@ HORIZONS = ["1d_close"]
 # 上限>9.5%剔除涨停股（尾盘封单买不进），下限<-3%剔除暴跌股（避免接飞刀）
 FILTER_TODAY_DAY_RET = 0.090  # T日日涨幅>9.0%剔除（涨停股买不进）
 FILTER_TODAY_DAY_RET_MIN = None  # 不设下限（网格搜索最优：无下限收益最高）
-TAKE_PROFIT = 0.020  # 开盘止盈2.0%（网格搜索：2026年收益最优1521%，回撤不变）
+TAKE_PROFIT = float(os.environ.get("OPEN_TP", "0.020"))  # 开盘止盈（环境变量控制，默认2.0%）
 STOP_LOSS = None  # 不止损（回测最优：-5%太紧会被洗盘甩出，不设止损收益最高）
-INTRADAY_TAKE_PROFIT = 0.040  # 盘中最高价涨4.0%止盈（网格搜索最优）
+INTRADAY_TAKE_PROFIT = float(os.environ.get("INTRADAY_TP", "0.040"))  # 盘中最高价止盈（环境变量控制，默认4.0%）
 # 分段动态开盘止盈（按当日Top1 pred）：pred<1%用1.5%、pred≥1%用3%（回测+9.4%，2024/25/26三年一致）
 # tuple=(pred分界, 弱信号tp, 强信号tp)；启用后 TAKE_PROFIT 仅作回退基准
-DYNAMIC_TP = (0.01, 0.015, 0.03)
+# 环境变量DYNAMIC_TP格式："0.01,0.015,0.03"，设为"none"关闭动态止盈
+_dtp_env = os.environ.get("DYNAMIC_TP", "0.01,0.015,0.03")
+if _dtp_env.lower() == "none":
+    DYNAMIC_TP = None
+else:
+    _parts = _dtp_env.split(",")
+    DYNAMIC_TP = (float(_parts[0]), float(_parts[1]), float(_parts[2]))
 # 二次排序：模型粗筛Top10后，按综合规则（振幅小+量比低+跳空高）重排选Top3
 # 回测验证：收益从4387万%提升到12073万%（2.75倍），胜率77.86%→81.68%
 RERANK_CANDIDATES = 10
@@ -47,9 +53,8 @@ RERANK_METHOD = "composite"  # composite=振幅+量比+跳空综合rank排序
 # 网格搜索最优：全7因子各参与排序（收益24763万% vs 3因子20180万%，胜率82.75%）
 RERANK_WEIGHTS = [2, 2, 1, 1, 1, 1, 1]  # 振幅2+量比2（网格搜索最优：10014万%，夏普15.29）
 
-# 信号强度过滤：Top1预测收益率<0.5%则空仓（弱信号胜率仅58%，回测验证：累计+25%、2026+9.7%、
-# 胜率82.7%→86%、夏普14.89→15.88、回撤-16.8%→-15%，全面正向）
-MIN_PRED = 0.005
+# 信号强度过滤：Top1预测收益率<阈值则空仓（环境变量MIN_PRED控制，默认0.005）
+MIN_PRED = float(os.environ.get("MIN_PRED", "0.005"))
 
 
 def main():
