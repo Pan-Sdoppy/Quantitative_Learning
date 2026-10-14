@@ -11,6 +11,19 @@
 
 ---
 
+## ⚠️ 核心铁律（最高优先级，违反必出bug）
+
+**训练/回测/预测三者必须使用完全一致的因子列表，有且只有训练时去冗余后的因子为准。**
+
+- `compute_factors()` 中的因子去冗余是基于数据相关性动态计算的，**不同数据集（全量训练 vs 最新预测）可能得到不同的去冗余结果**，导致因子数量/名称不一致。
+- **回测和预测时严禁使用 `compute_factors()` 返回的实时 `factor_cols`**，必须从模型保存的 meta 文件中读取训练时的 `feature_names`：
+  - 回测：`core/backtest_engine.py` 已通过 `model.feature_names` 自动对齐（`EnsembleModel.load()` 从 `ensemble_1d_close.json` 读取）。
+  - 预测：`predict.py` 必须从 `models/latest/predict/lgb_1d_close.meta.json` 读取 `feature_names`，强制对齐后再喂给模型。
+- 新增/删除因子后**必须重新训练模型**，否则预测时会报 `LightGBM feature count mismatch`。
+- 验证方法：`models/latest/predict/lgb_1d_close.meta.json` 中的 `feature_names` 数量必须等于 `lgb_1d_close.txt` 模型的 `num_feature()`。
+
+---
+
 ## 一、项目结构（根目录6个文件）
 
 ```

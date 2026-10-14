@@ -352,6 +352,24 @@ def main(pred_=["排名", "股票代码", "股票名称", "收盘价", "当天�
         logger.error("没有可用模型，请先运行 python train.py")
         return
 
+    # 强制使用模型训练时的因子列表，避免实时去冗余导致特征数不匹配
+    import os as _os
+    import json as _json
+    _meta_path = _os.path.join(MODEL_DIR, PREDICT_TAG, f"lgb_{HORIZONS[0]}.meta.json")
+    try:
+        with open(_meta_path, "r", encoding="utf-8") as _f:
+            _meta = _json.load(_f)
+        model_factor_cols = _meta.get("feature_names", [])
+        if model_factor_cols:
+            missing = [c for c in model_factor_cols if c not in latest_data.columns]
+            if missing:
+                logger.error(f"模型因子在最新数据中缺失: {missing}")
+                return
+            factor_cols = model_factor_cols
+            logger.info(f"已对齐模型因子列表: {len(factor_cols)} 个因子")
+    except Exception as _e:
+        logger.warning(f"读取模型因子列表失败({_e})，使用实时计算因子列表")
+
     available_horizons = list(models.keys())
     predictions = {}
     confidences = {}
