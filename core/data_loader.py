@@ -254,7 +254,8 @@ def _download_single(code: str, start_date: str, end_date: str, retries: int = 2
                 if len(check_df) >= 2:
                     max_jump = check_df["close"].pct_change().abs().max()
                     if max_jump > 0.20:
-                        logger.warning(f"股票 {code}({symbol}) 数据异常(单日跳空{max_jump * 100:.1f}%)，可能串行，丢弃重试")
+                        logger.warning(
+                            f"股票 {code}({symbol}) 数据异常(单日跳空{max_jump * 100:.1f}%)，可能串行或除权日qfq复权滞后，丢弃重试")
                         if attempt < retries - 1:
                             time.sleep(1)
                             continue
@@ -276,9 +277,13 @@ def _process_one_stock(code: str, name: str, start_date: str, today: str,
     """处理单只股票，使用元数据缓存快速判断是否需要下载
     is_intraday=True时，即使meta显示今天已更新，也强制重新下载今天的数据（盘中价格在变化）
     expected_latest: 预期的最新交易日，本地数据已到此日期则skip，否则下载
+    增量衔接跳变（>20%）时转全量重拉：串行污染可被纠正；除权日qfq复权滞后当天
+    全量重拉也会被硬校验拦截（返回空），此时保留本地旧数据、计skipped，次日复权因子
+    更新后重跑自动全量重拉修复。
     """
     file_path = RAW_DIR / f"{code}.parquet"
     today_ts = pd.Timestamp(today)
+    retry_after_jump = False  # 衔接跳变转全量重拉的标志
 
     # 用元数据快速判断是否已最新
     if not force_full and code in meta:
@@ -304,6 +309,34 @@ def _process_one_stock(code: str, name: str, start_date: str, today: str,
             existing = pd.read_parquet(file_path)
             existing["date"] = pd.to_datetime(existing["date"], errors="coerce")
             new_data["date"] = pd.to_datetime(new_data["date"], errors="coerce")
+            # 衔接校验：增量下载可能因baostock响应错位/串行把别的股票数据写入本文件。
+            # 注意：增量下载会向前多覆盖3天（含与本地重叠的历史行），因此不能拿新数据首行
+            # 与本地末日直接比较（二者可能相隔数个交易日，期间正常涨跌停会造成>20%假象）；
+            # 必须只取严格晚于本地末日的第一行（真正新增的首个交易日）与本地末日比较。
+            # 主板单日涨跌停±10%，>20%的两种原因：①串行污染；②除权日qfq复权因子当天滞后
+            # （如10转4.5，真实价直接跌约30%）；次新股上市初期无涨跌幅限制，豁免。
+            if not existing.empty and not new_data.empty:
+                ex_sorted = existing.sort_values("date")
+                new_sorted = new_data.sort_values("date")
+                last_date = ex_sorted["date"].iloc[-1]
+                last_existing = ex_sorted["close"].iloc[-1]
+                added = new_sorted[new_sorted["date"] > last_date]
+                if not added.empty:
+                    first_new = added["close"].iloc[0]
+                    if pd.notna(last_existing) and pd.notna(first_new) and last_existing > 0:
+                        jump = (first_new - last_existing) / last_existing
+                        is_new_stock = len(existing) < 60  # 次新股上市初期波动大，跳过校验
+                        if abs(jump) > 0.20 and not is_new_stock:
+                            # 两种可能：① baostock响应错位/串行污染（全量重拉可纠正）；
+                            # ② 除权除息日当天qfq复权因子滞后（次日才更新，如10转4.5除权日
+                            # 真实价直接跌30%），此时全量重拉会触发_download_single自身硬校验
+                            # 返回空，保留本地旧数据，等次日复权因子更新后全量重拉自愈。
+                            # 两种情况都不能直接合并，抛错转入下面的全量重拉路径。
+                            retry_after_jump = True
+                            raise RuntimeError(
+                                f"增量衔接跳变{jump * 100:+.1f}%（{last_existing:.2f}->{first_new:.2f}）"
+                                f"，转全量重拉校验（串行污染或除权日qfq滞后）"
+                            )
             combined = pd.concat([existing, new_data], ignore_index=True)
             combined = combined.drop_duplicates(subset=["date"], keep="last")
             combined = combined.sort_values("date").reset_index(drop=True)
@@ -315,9 +348,16 @@ def _process_one_stock(code: str, name: str, start_date: str, today: str,
         except Exception as e:
             logger.warning(f"股票 {code} 增量更新失败，重新全量下载: {e}")
 
-    # 全量下载（新股票或force_full或元数据缺失）
+    # 全量下载（新股票或force_full或元数据缺失，或增量衔接跳变后自愈重拉）
     new_data = _download_single(code, start_date, today)
     if new_data.empty:
+        if retry_after_jump:
+            # 衔接跳变后全量重拉仍失败：除权日qfq复权滞后（次日更新后自愈）或持续污染，
+            # 本地旧数据完好，计skipped（不是网络失败），保留旧数据，次日重跑自动修复。
+            logger.warning(f"股票 {code} 全量重拉仍异常，保留本地数据，次日自动重试（除权日qfq滞后或持续污染）")
+            with _stats_lock:
+                stats["skipped"] += 1
+            return "skip"
         with _stats_lock:
             stats["failed"] += 1
             failed_codes.append(code)

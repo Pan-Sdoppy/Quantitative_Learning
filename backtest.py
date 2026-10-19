@@ -4,10 +4,10 @@
 功能：
 1. 加载已训练的回测模型
 2. 基于训练文件的最新数据，在验证集上回测1天持仓动态卖出：
-      - 1d_close: T日尾盘买，动态卖出（开盘止盈2.0%+盘中止盈4.0%，不止损，弱信号空仓）
+      - 1d_close: T日尾盘买，动态卖出（开盘止盈按pred分段1.5%/3%，盘中止盈4.0%，不止损，弱信号空仓）
 3. 每次买3只股票，输出累计收益、年化、夏普、最大回撤、胜率、年度收益等指标
 4. 保存交易明细和净值曲线（覆盖保存）
-5. 已启用当天涨幅过滤：T日日涨幅>9.5%剔除涨停股，<-3%剔除暴跌股
+5. 已启用当天涨幅过滤：T日日涨幅>9.0%剔除涨停股（不设下限）
 
 用法：
     python backtest.py
@@ -26,11 +26,11 @@ from core.utils import PROCESSED_DIR, MODEL_DIR, get_logger
 warnings.filterwarnings("ignore")
 logger = get_logger("backtest")
 
-BACKTEST_TAG = "latest/backtest"  # 回测自动加载回测模型（训练到2023-12-31）
+BACKTEST_TAG = "latest/backtest"  # 回测自动加载回测模型（训练到2021-12-30，回测从2022-01-04起）
 TOP_N = 3
 HORIZONS = ["1d_close"]
-# 当天日涨幅区间过滤：T日日涨幅在(-3%, +9.5%)之外的剔除
-# 上限>9.5%剔除涨停股（尾盘封单买不进），下限<-3%剔除暴跌股（避免接飞刀）
+# 当天日涨幅区间过滤：T日日涨幅在(无下限, +9.0%)之外的剔除
+# 上限>9.0%剔除涨停股（尾盘封单买不进）；不设下限（网格搜索最优：暴跌股次日反弹概率高，无下限收益最高）
 FILTER_TODAY_DAY_RET = 0.090  # T日日涨幅>9.0%剔除（涨停股买不进）
 FILTER_TODAY_DAY_RET_MIN = None  # 不设下限（网格搜索最优：无下限收益最高）
 TAKE_PROFIT = float(os.environ.get("OPEN_TP", "0.020"))  # 开盘止盈（环境变量控制，默认2.0%）
@@ -45,16 +45,18 @@ if _dtp_env.lower() == "none":
 else:
     _parts = _dtp_env.split(",")
     DYNAMIC_TP = (float(_parts[0]), float(_parts[1]), float(_parts[2]))
-# 二次排序：模型粗筛Top10后，按综合规则（振幅小+量比低+跳空高）重排选Top3
-# 回测验证：收益从4387万%提升到12073万%（2.75倍），胜率77.86%→81.68%
+# 二次排序：模型粗筛Top10后，按综合规则重排选Top3。两部分：
+#   ① 基础5因子（权重见 RERANK_WEIGHTS，顺序 [振幅小, 5日量比小, 跳空高, 5日位置高, 3日动量高]）
+#   ② K线形态（上影线短/光头阳，权重常量在 backtest_engine）+ 规模/量能/资金流3因子（mv_log_yi/vol_ratio_10/mf_intraday，权重各1）
+# 完整回测：R2(min0.5) +2.768%/81.56% → 三因子(min1.0) +3.470%/89.57%，夏普12.95→14.98，回撤-25.1%→-15.2%
 RERANK_CANDIDATES = 10
-RERANK_METHOD = "composite"  # composite=振幅+量比+跳空综合rank排序
-# 权重顺序: [振幅小, 量比低, 跳空高, 换手率低, 成交额低, 5日位置高, 3日动量高]
-# 网格搜索最优：全7因子各参与排序（收益24763万% vs 3因子20180万%，胜率82.75%）
-RERANK_WEIGHTS = [2, 2, 1, 1, 1, 1, 1]  # 振幅2+量比2（网格搜索最优：10014万%，夏普15.29）
+RERANK_METHOD = "composite"  # composite=5基础因子+K线形态+规模/量能/资金流综合rank排序
+# 权重顺序: [振幅小, 5日量比小, 跳空高, 5日位置高, 3日动量高]（仅5个基础因子，各因子均"越小越靠前"）
+RERANK_WEIGHTS = [2, 2, 1, 1, 1]  # 振幅2+5日量比2，其余各1（网格扫描1:1:1三因子最优点，权重不敏感）
 
-# 信号强度过滤：Top1预测收益率<阈值则空仓（环境变量MIN_PRED控制，默认0.005）
-MIN_PRED = float(os.environ.get("MIN_PRED", "0.005"))
+# 信号强度过滤：二次排序后Top1的pred<阈值则空仓（环境变量MIN_PRED控制，默认0.010）
+# 阈值扫描（2022起，全年度单调）：min1.0 → 844开仓天/+3.470%/胜率89.57%/夏普14.98/回撤-15.2%（用户选定，夏普最高档）
+MIN_PRED = float(os.environ.get("MIN_PRED", "0.010"))
 
 
 def main():
@@ -81,7 +83,7 @@ def main():
     if factor_data is None:
         logger.info("计算因子...")
         all_data = load_all_data()
-        factor_data, _ = compute_factors(all_data)
+        factor_data, _ = compute_factors(all_data, skip_redundancy=True)
         factor_data.to_parquet(factor_path, index=False)
 
     # 兼容旧因子缓存：若缺少low列（盘中最低价止损需要），从raw数据补齐
@@ -133,18 +135,22 @@ def main():
     logger.info("\n" + "=" * 70)
     logger.info("Step 3: 运行回测")
 
-    # 从训练结束日的下一天开始回测（验证集），避免数据泄露
+    # 严格无泄露：优先读取 checkpoint 记录的回测起点；旧模型无该字段时回退到训练截止日+1
     start_dt = None
     cp_path = MODEL_DIR / BACKTEST_TAG / "_checkpoint.json"
     if cp_path.exists():
         try:
             import json
-            with open(cp_path) as f:
+            with open(cp_path, encoding="utf-8") as f:
                 cp = json.load(f)
-            train_end = cp.get("train_end_date")
-            if train_end:
-                start_dt = (pd.Timestamp(train_end) + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
-                logger.info(f"训练数据截止: {train_end}，回测从 {start_dt} 开始（验证集，无数据泄露）")
+            if cp.get("backtest_start"):
+                start_dt = cp["backtest_start"]
+                logger.info(f"模型记录回测起点: {start_dt}（训练截止 {cp.get('train_end_date')}，严格样本外）")
+            else:
+                train_end = cp.get("train_end_date")
+                if train_end:
+                    start_dt = (pd.Timestamp(train_end) + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+                    logger.info(f"训练数据截止: {train_end}，回测从 {start_dt} 开始（验证集，无数据泄露）")
         except Exception:
             pass
 
@@ -159,7 +165,7 @@ def main():
         horizons=available_horizons,
         start_date=start_dt,
         end_date=None,
-        take_profit=TAKE_PROFIT,  # 开盘止盈1.5%
+        take_profit=TAKE_PROFIT,  # 开盘止盈基准（被dynamic_tp分段动态覆盖）
         stop_loss=STOP_LOSS,  # 不止损
         filter_today_day_ret=FILTER_TODAY_DAY_RET,  # T日日涨幅>9.0%剔除
         filter_today_day_ret_min=FILTER_TODAY_DAY_RET_MIN,  # 不设下限
@@ -167,7 +173,7 @@ def main():
         rerank_candidates=RERANK_CANDIDATES,
         rerank_method=RERANK_METHOD,
         rerank_weights=RERANK_WEIGHTS,
-        min_pred=MIN_PRED,  # Top1预测收益率<0.5%空仓
+        min_pred=MIN_PRED,  # 二次排序后Top1 pred<1.0%空仓
         dynamic_tp=DYNAMIC_TP,  # 按pred分段动态开盘止盈
     )
 

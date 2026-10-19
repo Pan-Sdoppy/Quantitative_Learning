@@ -48,7 +48,7 @@ class LGBModel:
             "reg_lambda": 0.1,
             "max_depth": -1,
             "verbose": -1,
-            "n_jobs": -1,
+            "num_threads": 4,
             "seed": 42,
         }
         if self.use_gpu:
@@ -168,7 +168,7 @@ class XGBModel:
             "min_child_weight": 10,
             "reg_alpha": 0.1,
             "reg_lambda": 0.1,
-            "n_jobs": -1,
+            "n_jobs": 4,
             "seed": 42,
         }
         if self.use_gpu:
@@ -186,14 +186,15 @@ class XGBModel:
         # 转float32减少内存占用
         X_train_f32 = np.asarray(X_train, dtype=np.float32)
         y_train_f32 = np.asarray(y_train, dtype=np.float32)
-        dtrain = xgb.DMatrix(X_train_f32, label=y_train_f32)
+        # QuantileDMatrix 边量化边构造，不保留原始数据副本（数百万样本下可省约1份训练矩阵内存）
+        dtrain = xgb.QuantileDMatrix(X_train_f32, label=y_train_f32)
         del X_train_f32, y_train_f32
         evals = [(dtrain, "train")]
         dval = None
         if X_val is not None and y_val is not None:
             X_val_f32 = np.asarray(X_val, dtype=np.float32)
             y_val_f32 = np.asarray(y_val, dtype=np.float32)
-            dval = xgb.DMatrix(X_val_f32, label=y_val_f32)
+            dval = xgb.QuantileDMatrix(X_val_f32, label=y_val_f32, ref=dtrain)
             del X_val_f32, y_val_f32
             evals.append((dval, "val"))
         gc.collect()

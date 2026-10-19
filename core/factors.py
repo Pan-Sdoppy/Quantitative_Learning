@@ -142,6 +142,13 @@ def compute_factors_single(df: pd.DataFrame) -> pd.DataFrame:
     hl_range = high - low
     df["mf_intraday"] = safe_div(close - low, hl_range.replace(0, np.nan)) * amount
 
+    # ===== 流通市值对数（二次排序专用，不进模型特征）=====
+    # 流通市值(亿元) = 成交额 / (换手率/100) / 1e8；取对数作为规模因子。
+    # 仅用于模型粗筛后的二次排序（小市值次日溢价显著），不参与模型训练，故不做横截面标准化、
+    # 也不写入 factor_cols（rank 排序对整体平移/缩放不敏感，保留原始 log 值即可）。
+    _float_mv_yi = amount / (turnover.replace(0, np.nan) / 100.0) / 1e8
+    df["mv_log_yi"] = np.log(_float_mv_yi.replace(0, np.nan))
+
     # 3. 量价背离：涨但缩量=假突破风险（正值=量价配合好，负值=背离）
     df["vol_price_div"] = df["ret_1d"] * df["vol_ratio_5"]
 
@@ -155,13 +162,17 @@ def compute_factors_single(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def compute_factors(all_data: pd.DataFrame) -> tuple:
+def compute_factors(all_data: pd.DataFrame, skip_redundancy: bool = False,
+                    redundancy_cutoff: str = None) -> tuple:
     """
     对全市场数据计算因子（内存优化版）。
     - float32降精度
     - 丢弃冗余OHLCV列
     - 向量化横截面标准化
     - 分块处理避免内存峰值
+    - skip_redundancy=True时跳过去冗余（预测/回测时用，必须与训练因子列表对齐）
+    - redundancy_cutoff（如"2021-12-31"）：去冗余相关性矩阵仅用该日期及之前的样本计算，
+      严格防止未来样本参与因子筛选（无泄露切分用）；None时用全量样本。
     """
     import gc
     logger.info("开始计算因子...")
@@ -216,23 +227,36 @@ def compute_factors(all_data: pd.DataFrame) -> tuple:
     result["_cumcnt"] = result.groupby("code").cumcount()
     result = result[result["_cumcnt"] >= 60].drop(columns=["_cumcnt"]).reset_index(drop=True)
 
-    # 识别因子列（ret_1d_raw保留原始收益率不标准化，用于涨停判断）
+    # 识别因子列（ret_1d_raw保留原始收益率不标准化，用于涨停判断；
+    # mv_log_yi 为二次排序专用规模因子，不进模型特征，保留原始 log 值不标准化）
     result["ret_1d_raw"] = result["ret_1d"]
-    factor_cols = [c for c in result.columns if
-                   c not in ["date", "code", "open", "high", "low", "close", "ret_1d_raw", "high_low_ratio"]]
+    _NON_FEATURE_COLS = ["date", "code", "open", "high", "low", "close", "ret_1d_raw",
+                         "high_low_ratio", "mv_log_yi"]
+    factor_cols = [c for c in result.columns if c not in _NON_FEATURE_COLS]
     logger.info(f"共 {len(factor_cols)} 个因子，{len(result)} 行，进行横截面标准化...")
 
     # 因子去冗余：相关性>0.95的因子只保留第一个（减少过拟合）
-    logger.info("因子去冗余：计算因子间相关性矩阵...")
-    corr_matrix = result[factor_cols].corr().abs()
-    upper = corr_matrix.where(np.triu(np.ones(corr_matrix.shape), k=1).astype(bool))
-    to_drop = [col for col in upper.columns if any(upper[col] > 0.95)]
-    if to_drop:
-        logger.info(f"剔除 {len(to_drop)} 个高相关冗余因子: {to_drop}")
-        factor_cols = [c for c in factor_cols if c not in to_drop]
-        result = result.drop(columns=to_drop, errors="ignore")
+    # 注意：仅训练时启用；预测/回测时必须跳过，用训练时保存的feature_names对齐
+    if skip_redundancy:
+        logger.info("跳过去冗余（预测/回测模式，使用训练时因子列表）")
     else:
-        logger.info("无高相关冗余因子")
+        if redundancy_cutoff is not None:
+            # 严格无泄露：相关性矩阵只用训练截止日前的样本，未来样本不参与因子筛选
+            corr_df = result[result["date"] <= pd.Timestamp(redundancy_cutoff)]
+            logger.info(f"因子去冗余（无泄露口径）：相关性矩阵仅用 <= {redundancy_cutoff} 的样本，"
+                        f"{len(corr_df)} 行（全量 {len(result)} 行）")
+        else:
+            corr_df = result
+            logger.info("因子去冗余：计算因子间相关性矩阵...")
+        corr_matrix = corr_df[factor_cols].corr().abs()
+        upper = corr_matrix.where(np.triu(np.ones(corr_matrix.shape), k=1).astype(bool))
+        to_drop = [col for col in upper.columns if any(upper[col] > 0.95)]
+        if to_drop:
+            logger.info(f"剔除 {len(to_drop)} 个高相关冗余因子: {to_drop}")
+            factor_cols = [c for c in factor_cols if c not in to_drop]
+            result = result.drop(columns=to_drop, errors="ignore")
+        else:
+            logger.info("无高相关冗余因子")
 
     # 向量化横截面标准化：先算每日mean/std，再merge（比transform省内存）
     date_group = result.groupby("date")[factor_cols]
@@ -246,6 +270,12 @@ def compute_factors(all_data: pd.DataFrame) -> tuple:
     result[factor_cols] = result[factor_cols].clip(-5, 5)
     # 填充NaN
     result[factor_cols] = result[factor_cols].fillna(0)
+
+    # 二次排序专用列 mv_log_yi：不标准化，缺失（换手率为0等）用全市场中位数补中性规模，
+    # 避免 rank 时这些票被丢弃；降为 float32 控制内存
+    if "mv_log_yi" in result.columns:
+        result["mv_log_yi"] = result["mv_log_yi"].astype("float32")
+        result["mv_log_yi"] = result["mv_log_yi"].fillna(result["mv_log_yi"].median())
 
     # ========== 增加市场状态特征（沪深300，不参与横截面标准化） ==========
     try:

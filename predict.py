@@ -5,15 +5,16 @@
 1. 自动判断当前时间：交易日9:30-15:00自动更新最新实时数据，其余时间用训练文件的最新数据
 2. 计算最新因子
 3. 加载已训练的预测模型，对全市场股票预测
-4. 给出1天持仓动态卖出的置信度（保留4位小数）：
-      - 1d_close: T日尾盘买，T+1动态卖（开盘0.5%止盈+盘中4.5%止盈）
-5. 按动态卖出置信度优先排序，输出Top股票推荐
-6. 打印本次预测基于的数据时间范围
+4. 模型预测次日收益率 pred（标签口径：T日尾盘买、T+1动态卖，训练标签用开盘0.5%/盘中4.5%以聚焦选股）
+5. 先按 pred 粗筛 Top10，再做 composite 二次排序（5基础因子+K线形态+规模/量能/资金流，与回测引擎逐因子同口径）选 Top3
+6. 二次排序后 Top1 的 pred<MIN_PRED(1.0%) 提示空仓；并打印 T+1 兑现提示（开盘止盈按 pred 分段 1.5%/3%，盘中 4%，不止损）
+7. 打印本次预测基于的数据时间范围（综合排序 Top10 打印列：排名/代码/名称/收盘价/当天涨幅/pred/所属板块）
 
 用法：
     python predict.py
 """
 import json
+import sys
 import warnings
 from datetime import datetime, time
 from pathlib import Path
@@ -21,6 +22,10 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from core.backtest_engine import (
+    KLINE_SHADOW_W, KLINE_KFLAG_W, KLINE_BODY_W, KLINE_HIGH20_W,
+    RERANK_MV_W, RERANK_VOL10_W, RERANK_MF_W,
+)
 from core.data_loader import load_all_data, get_stock_list, get_stock_industry
 from core.factors import compute_factors
 from core.model import EnsembleModel, compute_confidence
@@ -36,7 +41,7 @@ INTRADAY_CACHE_FILE = Path(RAW_DIR) / "_intraday_last_update.json"
 INTRADAY_DATA_CACHE = Path(RAW_DIR) / "_intraday_cache.parquet"
 INTRADAY_MIN_INTERVAL = 0  # 盘中每次运行都获取最新实时数据，不缓存（0=不节流）
 MIN_STOCKS_PER_DAY = 1000  # 最新交易日最少股票数，避免盘中数据不完整
-MIN_PRED = 0.005  # 信号强度过滤：综合排序Top1预测次日收益<0.5%提示空仓（与backtest.py一致）
+MIN_PRED = 0.010  # 信号强度过滤：综合排序Top1预测次日收益<1.0%提示空仓（与 backtest_engine/train 守卫一致，2022起夏普最高阈值）
 # 分段动态开盘止盈（与backtest.py一致）：pred<1%开盘止盈1.5%、pred≥1%开盘止盈3%，盘中止盈4%
 DYN_TP_BOUNDARY = 0.01
 DYN_TP_LOW = 0.015
@@ -173,13 +178,26 @@ def save_intraday_update_time(now: datetime):
 
 
 def load_intraday_cache(now: datetime):
-    """加载盘中实时数据缓存（距上次更新不足15分钟时复用）"""
-    if INTRADAY_DATA_CACHE.exists():
-        try:
-            return pd.read_parquet(INTRADAY_DATA_CACHE)
-        except Exception:
+    """加载盘中实时数据缓存。
+    硬性规则：盘中只接受【今天】的缓存，绝不允许拿前一天/上周五的旧行情
+    冒充实时数据继续出预测（旧缓存只能在非交易时间走存量分支，不能用于盘中）。"""
+    if not INTRADAY_DATA_CACHE.exists() or not INTRADAY_CACHE_FILE.exists():
+        return None
+    try:
+        with open(INTRADAY_CACHE_FILE, "r", encoding="utf-8") as f:
+            last = json.load(f).get("last_update")
+        if not last:
             return None
-    return None
+        last_dt = datetime.fromisoformat(last)
+        if last_dt.date() != now.date():
+            logger.error(f"盘中缓存是 {last_dt:%Y-%m-%d %H:%M} 的旧数据（非今天），拒绝用于实时预测")
+            return None
+        df = pd.read_parquet(INTRADAY_DATA_CACHE)
+        if df is None or df.empty:
+            return None
+        return df
+    except Exception:
+        return None
 
 
 def save_intraday_cache(df: pd.DataFrame):
@@ -229,6 +247,10 @@ def fetch_intraday_data() -> pd.DataFrame:
             spot[c] = pd.to_numeric(spot[c], errors="coerce")
     # 剔除无效数据（最新价为空或0）
     spot = spot[(spot["close"] > 0) & spot["close"].notna()]
+    # 合理性校验：主板正常 3000+ 只，返回行数过少说明接口抖动/返回错误页/数据截断，
+    # 直接抛异常，禁止拿残缺数据继续出预测
+    if len(spot) < 2000:
+        raise RuntimeError(f"实时行情仅返回 {len(spot)} 只主板股票（正常应3000+），疑似接口异常，拒绝使用")
     logger.info(f"盘中实时行情获取完成: {len(spot)} 只主板股票")
     return spot.reset_index(drop=True)
 
@@ -242,11 +264,37 @@ def merge_intraday_data(historical: pd.DataFrame, intraday: pd.DataFrame) -> pd.
     # 历史数据中剔除当天已有记录（盘中重复运行时用最新实时数据替换）
     today = pd.Timestamp(now.date())
     hist = historical[historical["date"] < today].copy()
+
+    # 防御1：剔除停牌/无成交的实时行（实时快照成交量为0=停牌，价格多为昨收，尾盘买不进）
+    if "volume" in intraday.columns:
+        n_before = len(intraday)
+        intraday = intraday[intraday["volume"].fillna(0) > 0]
+        n_stop = n_before - len(intraday)
+        if n_stop > 0:
+            logger.warning(f"盘中剔除停牌/无成交股票 {n_stop} 只")
+
     # 补齐历史有但实时缺失的列
     for c in hist.columns:
         if c not in intraday.columns:
             intraday[c] = np.nan
     intraday = intraday[hist.columns]
+
+    # 防御2：实时价 vs 本地qfq昨收 涨幅异常(|跳空|>15%)，视为复权错位/脏数据，剔除该股今日行
+    # （主板单日涨跌停±10%，qfq基准下正常不可能超15%；600520/600521曾因qfq串行出现-98%/-20%脏值）
+    yesterday = (hist.sort_values("date").groupby("code", sort=False).tail(1)
+                 [["code", "close"]].rename(columns={"close": "_prev_close"}))
+    intraday = intraday.merge(yesterday, on="code", how="left")
+    jump = (intraday["close"] - intraday["_prev_close"]) / intraday["_prev_close"]
+    bad_mask = intraday["_prev_close"].notna() & (jump.abs() > 0.15)
+    n_bad = int(bad_mask.sum())
+    if n_bad > 0:
+        bad_codes = intraday.loc[bad_mask, "code"].tolist()
+        bad_jumps = [f"{c}:{v * 100:+.1f}%" for c, v in zip(bad_codes, jump[bad_mask].tolist())]
+        logger.warning(f"盘中剔除实时价与qfq昨收涨幅异常股票 {n_bad} 只: {bad_jumps}")
+        intraday = intraday[~bad_mask]
+    if "_prev_close" in intraday.columns:
+        intraday = intraday.drop(columns=["_prev_close"])
+
     merged = pd.concat([hist, intraday], ignore_index=True)
     merged["code"] = merged["code"].astype("category")
     return merged.sort_values(["date", "code"]).reset_index(drop=True)
@@ -288,15 +336,24 @@ def main(pred_=["排名", "股票代码", "股票名称", "收盘价", "当天�
                 save_intraday_cache(intraday_df)
                 save_intraday_update_time(now)
             except Exception as e:
-                logger.warning(f"盘中实时数据获取失败({e})，尝试使用缓存")
+                logger.warning(f"盘中实时数据获取失败({e})，尝试使用今天的缓存")
                 intraday_df = load_intraday_cache(now)
                 if intraday_df is None:
-                    use_intraday = False
+                    # 盘中跑预测就是为了看实时数据，没有今天的实时数据就直接停止，
+                    # 绝不允许降级到历史存量数据冒充实时（会误导实盘买入）
+                    logger.error("=" * 70)
+                    logger.error("盘中实时数据获取失败，且没有今天的盘中缓存：预测已停止。")
+                    logger.error("盘中预测必须基于当日实时行情，禁止用历史数据冒充，请稍后重试。")
+                    logger.error("=" * 70)
+                    sys.exit(1)
         else:
-            logger.info("Step 1: 交易时间内，但距上次更新不足15分钟，使用缓存")
+            logger.info("Step 1: 交易时间内，距上次更新不足15分钟，使用今天的缓存")
             intraday_df = load_intraday_cache(now)
             if intraday_df is None:
-                use_intraday = False
+                logger.error("=" * 70)
+                logger.error("盘中缓存无效（非今天或损坏）：预测已停止，请稍后重试。")
+                logger.error("=" * 70)
+                sys.exit(1)
     else:
         logger.info("Step 1: 非交易时间，使用训练文件的最新存量数据（不更新）")
 
@@ -307,11 +364,14 @@ def main(pred_=["排名", "股票代码", "股票名称", "收盘价", "当天�
     if use_intraday and intraday_df is not None and not intraday_df.empty:
         all_data = merge_intraday_data(all_data, intraday_df)
         logger.info(f"本次预测基于实时数据: {all_data['date'].min():%Y-%m-%d} ~ {all_data['date'].max():%Y-%m-%d}")
+    elif use_intraday:
+        # 双保险：盘中走到这里说明实时数据缺失（Step 1 已应拦截），直接停止，不允许降级
+        logger.error("盘中实时数据缺失：预测已停止，禁止用历史存量数据冒充实时行情。")
+        sys.exit(1)
     else:
-        use_intraday = False
         logger.info(f"本次预测基于存量数据: {all_data['date'].min():%Y-%m-%d} ~ {all_data['date'].max():%Y-%m-%d}")
 
-    factor_data, factor_cols = compute_factors(all_data)
+    factor_data, factor_cols = compute_factors(all_data, skip_redundancy=True)
     del all_data
     import gc
     gc.collect()
@@ -324,6 +384,17 @@ def main(pred_=["排名", "股票代码", "股票名称", "收盘价", "当天�
         return
     latest_date = valid_days.max()
     latest_data = factor_data[factor_data["date"] == latest_date].copy()
+
+    # 股票池过滤：只保留主板可买列表内股票，剔除已退市/ST残留等池外异常票（在预测前过滤，保证 pred 与行情同序）
+    try:
+        _stock_list = get_stock_list()
+        _tradable = set(_stock_list["code"].astype(str).str.zfill(6))
+        _before = len(latest_data)
+        latest_data = latest_data[latest_data["code"].astype(str).str.zfill(6).isin(_tradable)].copy()
+        logger.info(f"股票池过滤: {_before} -> {len(latest_data)} 只（剔除池外异常票 {_before - len(latest_data)} 只）")
+    except Exception as e:
+        logger.warning(f"股票池过滤失败({e})，未过滤")
+
     logger.info(f"预测基准日: {latest_date:%Y-%m-%d}, 可预测股票数: {len(latest_data)}")
 
     # 读取预测模型的训练数据范围（checkpoint）
@@ -384,7 +455,14 @@ def main(pred_=["排名", "股票代码", "股票名称", "收盘价", "当天�
     # ========== Step 4: 组装预测结果 ==========
     logger.info("\n" + "=" * 70)
     logger.info("Step 4: 组装预测结果")
-    result = latest_data[["code", "close"]].copy()
+    # 构造输出：除 code/close 外，一次性取齐二次排序所需的原始价格与因子列。
+    # 必须包含 open/high/low（否则K线形态因子 issubset 恒为 False，回测有而实盘不生效的历史bug）。
+    # 列清单与 backtest_engine.composite 完全对齐：基础5因子 + K线(open/high/low) + 规模/量能/资金流3因子。
+    _rerank_cols = ["code", "open", "high", "low", "close",
+                    "amplitude_1d", "vol_ratio_5", "gap_ratio", "close_position_5d", "ret_3d",
+                    "mv_log_yi", "vol_ratio_10", "mf_intraday"]
+    _take = [c for c in _rerank_cols if c in latest_data.columns]
+    result = latest_data[_take].copy()
     result["code"] = result["code"].astype(str).str.zfill(6)
 
     # 加载股票名称映射
@@ -416,13 +494,6 @@ def main(pred_=["排名", "股票代码", "股票名称", "收盘价", "当天�
     # 涨停标记：主板涨停10%，>=9.9%视为涨停（考虑四舍五入）
     result["is_limit_up"] = result["latest_pct_chg"] >= 0.095
     result["limit_status"] = result["is_limit_up"].map({True: "涨停", False: "可买入"})
-
-    # 二次排序所需因子（7因子：振幅小+量比低+跳空高+换手率低+成交额低+5日位置高+3日动量高）
-    for rc in ["amplitude_1d", "vol_ratio_5", "gap_ratio"]:
-        if rc in latest_data.columns:
-            result[rc] = latest_data[rc].values
-        else:
-            result[rc] = np.nan
 
     for h in available_horizons:
         result[f"pred_ret_{h}"] = np.round(predictions[h], 6)
@@ -476,93 +547,58 @@ def main(pred_=["排名", "股票代码", "股票名称", "收盘价", "当天�
     print_table(display.head(4000))  # 终端只打印前50，完整结果存CSV
     print("=" * 100)
 
-    # === 连续上榜优先加分：计算过去N天模型Top10候选（与回测一致，N=2,bonus=2.0）===
-    STREAK_WINDOW = 2
-    STREAK_BONUS = 2.0
-    recent_top10 = []
-    try:
-        all_dates = sorted(factor_data["date"].unique())
-        latest_pos = all_dates.index(latest_date) if latest_date in all_dates else len(all_dates) - 1
-        hist_dates = all_dates[max(0, latest_pos - STREAK_WINDOW):latest_pos]
-        _h0 = available_horizons[0]
-        for _hd in hist_dates:
-            _hday = factor_data[factor_data["date"] == _hd].copy()
-            if len(_hday) < 10:
-                continue
-            if "ret_1d_raw" in _hday.columns:
-                _hday = _hday[(_hday["ret_1d_raw"] < 0.095) & (_hday["ret_1d_raw"] <= 0.090)]
-            if len(_hday) < 10:
-                continue
-            _hpred = models[_h0].predict(_hday[factor_cols])
-            _hday = _hday.assign(_pred=_hpred)
-            _top10 = set(_hday.nlargest(10, "_pred")["code"].astype(str).str.zfill(6).tolist())
-            recent_top10.append(_top10)
-        logger.info(f"连续上榜参考: 过去{len(recent_top10)}天Top10候选已计算")
-    except Exception as _e:
-        logger.warning(f"连续上榜历史Top10计算失败({_e})，跳过加分")
-        recent_top10 = []
-
-    # ========== 综合排序Top10（二次排序：模型粗筛Top10→7因子手工composite重排+连续上榜加分） ==========
+    # ========== 综合排序Top10（模型粗筛Top10→composite二次排序，口径与 backtest_engine 完全一致） ==========
     try:
         buyable = result[~result["is_limit_up"]].copy()
-        buyable = buyable[buyable["latest_pct_chg"] <= 0.090]  # 涨幅过滤：无下限，上限9.0%（网格搜索最优）
-        conf_col = f"confidence_{available_horizons[0]}"
+        buyable = buyable[buyable["latest_pct_chg"] <= 0.090]  # 涨幅过滤：无下限，上限9.0%（避免追高，与回测一致）
         pred_col = f"pred_ret_{available_horizons[0]}"
-        candidates = buyable.nlargest(10, conf_col).copy()
+        # 粗筛：按 pred 选 Top10 候选（与回测 nlargest(pred) 口径一致；置信度是pred的单调映射，集合相同）
+        candidates = buyable.nlargest(10, pred_col).copy()
         candidates["pred"] = candidates[pred_col]
-        for rc in ["turnover_ratio", "amount_ratio", "close_position_5d", "ret_3d"]:
-            if rc not in candidates.columns and rc in latest_data.columns:
-                candidates[rc] = latest_data.set_index("code").reindex(candidates["code"])[rc].values
+        # composite 打分，与 backtest_engine._backtest_single_mode 逐因子对齐（score 越小越靠前）
+        # 基础5因子：[振幅2, 5日量比2, 跳空1, 5日位置1, 3日动量1]
+        w = [2, 2, 1, 1, 1]
         score = pd.Series(0.0, index=candidates.index)
         if "amplitude_1d" in candidates.columns:
-            score += 2 * candidates["amplitude_1d"].rank(ascending=True)
+            score += w[0] * candidates["amplitude_1d"].rank(ascending=True)  # 振幅小→靠前
         if "vol_ratio_5" in candidates.columns:
-            score += 2 * candidates["vol_ratio_5"].rank(ascending=True)  # 量比权重2（网格搜索最优）
+            score += w[1] * candidates["vol_ratio_5"].rank(ascending=True)  # 缩量→靠前
         if "gap_ratio" in candidates.columns:
-            score -= 1 * candidates["gap_ratio"].rank(ascending=True)
-        if "turnover_ratio" in candidates.columns:
-            score += 1 * candidates["turnover_ratio"].rank(ascending=True)
-        if "amount_ratio" in candidates.columns:
-            score += 1 * candidates["amount_ratio"].rank(ascending=True)
+            score -= w[2] * candidates["gap_ratio"].rank(ascending=True)  # 高开→靠前
         if "close_position_5d" in candidates.columns:
-            score -= 1 * candidates["close_position_5d"].rank(ascending=True)
+            score -= w[3] * candidates["close_position_5d"].rank(ascending=True)  # 5日高位→靠前
         if "ret_3d" in candidates.columns:
-            score -= 1 * candidates["ret_3d"].rank(ascending=True)
-        # === K线形态因子（与回测一致：上影线短w=1.0，光头阳加/光头阴减w=0.5）===
-        if {'open', 'high', 'low', 'close'}.issubset(candidates.columns):
+            score -= w[4] * candidates["ret_3d"].rank(ascending=True)  # 3日动量强→靠前
+        # K线形态（open/high/low 现已随 result 取齐；上影短/光头阳权重由常量单一来源）
+        if (KLINE_SHADOW_W or KLINE_KFLAG_W or KLINE_BODY_W or KLINE_HIGH20_W) and \
+                {'open', 'high', 'low', 'close'}.issubset(candidates.columns):
             _eps = 1e-9
             _rng = (candidates['high'] - candidates['low']).clip(lower=_eps)
             _upper = (candidates['high'] - np.maximum(candidates['open'], candidates['close'])) / _rng
-            _bull = ((candidates['close'] >= candidates['high'] - 0.01 * _rng) & (candidates['close'] > candidates['open']))
-            _bear = ((candidates['close'] <= candidates['low'] + 0.01 * _rng) & (candidates['close'] < candidates['open']))
-            score += 1.0 * _upper.rank(ascending=True)  # 上影线短→rank小→靠前
-            _morph = _bull.astype(int) - _bear.astype(int)
-            score -= 0.5 * _morph.rank(ascending=True)  # 光头阳(+1)→靠前；光头阴(-1)→靠后
-        # === 日内形态因子（与回测一致：开盘价位置低优先w=2.0，实体强度低优先w=1.0）===
-        if {'open', 'high', 'low', 'close'}.issubset(candidates.columns):
-            _eps = 1e-9
-            _rng = (candidates['high'] - candidates['low']).clip(lower=_eps)
-            _open_pos = (candidates['open'] - candidates['low']) / _rng
-            score += 2.0 * _open_pos.rank(ascending=True)  # 低开→rank小→靠前
             _body = (candidates['close'] - candidates['open']).abs() / _rng
-            score += 1.0 * _body.rank(ascending=True)  # 十字星→rank小→靠前
-        # === 连续上涨天数因子（与回测一致：连涨多=强势延续，w=1.0）===
-        if "streak_up" in candidates.columns:
-            score -= 1.0 * candidates["streak_up"].rank(ascending=True)  # 连涨多→rank大→靠前
-        # 连续上榜加分：连续N天在Top10候选里的股票加 STREAK_BONUS*连续天数
-        if recent_top10:
-            for _idx, _code in candidates["code"].items():
-                _streak = 0
-                for _past in reversed(recent_top10):
-                    if _code in _past:
-                        _streak += 1
-                    else:
-                        break
-                if _streak >= 1:
-                    score.at[_idx] += STREAK_BONUS * _streak
+            _bull = ((candidates['close'] >= candidates['high'] - 0.01 * _rng) & (
+                        candidates['close'] > candidates['open']))
+            _bear = ((candidates['close'] <= candidates['low'] + 0.01 * _rng) & (
+                        candidates['close'] < candidates['open']))
+            if KLINE_SHADOW_W:
+                score += KLINE_SHADOW_W * _upper.rank(ascending=True)  # 上影线短→rank小→靠前
+            if KLINE_KFLAG_W:
+                _morph = _bull.astype(int) - _bear.astype(int)
+                score -= KLINE_KFLAG_W * _morph.rank(ascending=True)  # 光头阳→靠前；光头阴→靠后
+            if KLINE_BODY_W:
+                score -= KLINE_BODY_W * _body.rank(ascending=True)
+            if KLINE_HIGH20_W and 'ret_20d' in candidates.columns:
+                score += KLINE_HIGH20_W * candidates['ret_20d'].rank(ascending=True)
+        # 规模/量能/资金流三因子（小值优先，各权重1，与回测一致）
+        if RERANK_MV_W and "mv_log_yi" in candidates.columns:
+            score += RERANK_MV_W * candidates["mv_log_yi"].rank(ascending=True)  # 小市值→靠前
+        if RERANK_VOL10_W and "vol_ratio_10" in candidates.columns:
+            score += RERANK_VOL10_W * candidates["vol_ratio_10"].rank(ascending=True)  # 10日缩量→靠前
+        if RERANK_MF_W and "mf_intraday" in candidates.columns:
+            score += RERANK_MF_W * candidates["mf_intraday"].rank(ascending=True)  # 低位收盘/非放量→靠前
         candidates["综合排序分"] = score
         candidates = candidates.sort_values("综合排序分")
-        rerank_desc = "7因子手工重排"
+        rerank_desc = "composite二次排序（5基础因子+K线形态+规模/量能/资金流）"
         rerank_display = candidates[["code", "name", "close", "latest_pct_chg", "pred", "industry"]].copy()
         rerank_display.insert(0, "排名", range(1, len(rerank_display) + 1))
         rerank_display.columns = pred_
