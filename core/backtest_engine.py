@@ -21,11 +21,11 @@ from .utils import RESULT_DIR, get_logger
 # === K线形态因子（2022-01起完整样本外回测验证，R2简化配置）===
 # 仅保留两个有稳定正增益的形态因子；其余形态/连涨/上榜因子经完整回测验证为负向或无效，已删除：
 #   - 开盘价位置 OPEN_POS_W 是 2024+ 过拟合（2022起全样本失效），删除
-#   - 实体强度 BODY_STR_W 不稳定、连涨 STREAK_UP_W 零作用、连续上榜 STREAK_BONUS 关闭后略好，删除
+#   - 实体强度 BODY_STR_W / KLINE_BODY_W 不稳定或负向，删除
+#   - 20日高位回避 KLINE_HIGH20_W 负向，删除
+#   - 连涨 STREAK_UP_W 零作用、连续上榜 STREAK_BONUS 关闭后略好，删除
 KLINE_SHADOW_W = 1.0  # 上影线短加分权重（短上影=无冲高回落，回测验证有效）
 KLINE_KFLAG_W = 0.5  # 光头阳加分/光头阴减分权重（半权重，全权重扭曲排序）
-KLINE_BODY_W = 0.0  # 实体强度：叠加后负向/无增益，保持关闭
-KLINE_HIGH20_W = 0.0  # 20日高位回避：负向，保持关闭
 
 # === composite 二次排序新增因子（小值优先，2022-01起严格样本外回测验证为正增益）===
 # 三者方向均为"越小越靠前"，与基础缩量/形态因子共线度低，权重各 1（0.5~2 扫描不敏感，1:1:1 最优）
@@ -110,7 +110,7 @@ def run_backtest(factor_data: pd.DataFrame, models: dict,
             factor_data = factor_data.merge(ind_df, on="code", how="left")
             factor_data["industry"] = factor_data["industry"].fillna("")
             del ind_df
-            logger.info(f"板块涨停集中度因子启用：行业归属加载完成")
+            logger.info("板块涨停集中度因子启用：行业归属加载完成")
         except Exception as _e:
             logger.warning(f"行业归属加载失败，板块涨停因子不生效: {_e}")
 
@@ -283,36 +283,42 @@ def _backtest_single_mode(factor_data: pd.DataFrame, model, mode: str, top_n: in
     trades = []
     stock_trades = []
     equity_points = []
+    empty_days = []  # 每个空仓日 {"date", "reason"}，保证每个交易日都有“开仓/空仓”交代
     skipped_empty = 0
     skipped_filter = 0
+
+    def _mark_empty(dt, reason):
+        """记录一个空仓日：净值不变化（追加equity点），并登记空仓原因。"""
+        nonlocal skipped_empty
+        skipped_empty += 1
+        empty_days.append({"date": dt, "reason": reason})
+        equity_points.append({"date": dt, "equity": equity})
 
     pbar_desc = "回测 动态卖出"
 
     for rebal_date in tqdm(rebalance_dates, desc=pbar_desc, ncols=100):
         day_data = factor_data[factor_data["date"] == rebal_date].copy()
         if len(day_data) < top_n:
+            _mark_empty(rebal_date, "当日有效样本不足（可买股票少于TopN）")
             continue
 
         # 市场择时：极端熊市空仓
         if has_market_feature:
             market_trend = day_data["hs300_trend"].iloc[0]
             if market_trend < MARKET_TIMING_EMPTY:
-                skipped_empty += 1
-                equity_points.append({"date": rebal_date, "equity": equity})
+                _mark_empty(rebal_date, f"大盘择时（沪深300低于20日均线{abs(MARKET_TIMING_EMPTY) * 100:.0f}%以上）")
                 continue
 
         # 大盘当天收阴线则空仓（沪深300当日收益<0）
         if skip_if_index_down and "hs300_ret_1d" in day_data.columns:
             idx_ret = day_data["hs300_ret_1d"].iloc[0]
             if idx_ret < 0:
-                skipped_empty += 1
-                equity_points.append({"date": rebal_date, "equity": equity})
+                _mark_empty(rebal_date, "大盘当日收阴（沪深300当日收益<0）")
                 continue
         # 大盘5日收益低于阈值则空仓（市场状态过滤，None=不启用）
         if index_5d_empty is not None and "hs300_ret_5d" in day_data.columns:
             if day_data["hs300_ret_5d"].iloc[0] < index_5d_empty:
-                skipped_empty += 1
-                equity_points.append({"date": rebal_date, "equity": equity})
+                _mark_empty(rebal_date, f"大盘5日弱势（沪深300五日收益<{index_5d_empty * 100:.1f}%）")
                 continue
 
         # 板块涨停集中度：计算当天每个板块涨停股票数（涨停集中板块→强势）
@@ -414,6 +420,7 @@ def _backtest_single_mode(factor_data: pd.DataFrame, model, mode: str, top_n: in
                 logger.debug(f"  {rebal_date:%Y-%m-%d}: 上影线过滤剔除{before - len(day_data)}只")
 
         if len(day_data) < top_n:
+            _mark_empty(rebal_date, "涨停/大阳线等过滤后可买标的不足TopN")
             continue
 
         # 二次排序：先选Top rerank_candidates 候选，再按规则重排
@@ -442,27 +449,21 @@ def _backtest_single_mode(factor_data: pd.DataFrame, model, mode: str, top_n: in
                     score -= w[3] * candidates["close_position_5d"].rank(ascending=True)  # 5日高位→靠前
                 if "ret_3d" in candidates.columns:
                     score -= w[4] * candidates["ret_3d"].rank(ascending=True)  # 3日动量强→靠前
-                # --- K线形态因子（上影线短/光头形态；body/high20 默认关闭）---
-                if (KLINE_SHADOW_W or KLINE_KFLAG_W or KLINE_BODY_W or KLINE_HIGH20_W) and {'open', 'high', 'low',
-                                                                                            'close'}.issubset(
-                        candidates.columns):
+                # --- K线形态因子（上影线短 + 光头阳/阴形态，2022起样本外回测验证为正增益）---
+                if (KLINE_SHADOW_W or KLINE_KFLAG_W) and {'open', 'high', 'low',
+                                                          'close'}.issubset(candidates.columns):
                     _eps = 1e-9
                     _rng = (candidates['high'] - candidates['low']).clip(lower=_eps)
                     _upper = (candidates['high'] - np.maximum(candidates['open'], candidates['close'])) / _rng
-                    _body = (candidates['close'] - candidates['open']).abs() / _rng
                     _bull = ((candidates['close'] >= candidates['high'] - 0.01 * _rng) & (
-                                candidates['close'] > candidates['open']))
+                            candidates['close'] > candidates['open']))
                     _bear = ((candidates['close'] <= candidates['low'] + 0.01 * _rng) & (
-                                candidates['close'] < candidates['open']))
+                            candidates['close'] < candidates['open']))
                     if KLINE_SHADOW_W:
                         score += KLINE_SHADOW_W * _upper.rank(ascending=True)  # 上影线短→rank小→靠前
                     if KLINE_KFLAG_W:
                         _morph = _bull.astype(int) - _bear.astype(int)
                         score -= KLINE_KFLAG_W * _morph.rank(ascending=True)  # 光头阳(+1)→rank大→靠前；光头阴(-1)→靠后
-                    if KLINE_BODY_W:
-                        score -= KLINE_BODY_W * _body.rank(ascending=True)  # 实体大→rank大→靠前
-                    if KLINE_HIGH20_W and 'ret_20d' in candidates.columns:
-                        score += KLINE_HIGH20_W * candidates['ret_20d'].rank(ascending=True)  # 20日涨幅高→rank大→靠后（回避高位）
                 # --- 规模/量能/资金流三因子（小值优先，2022起完整回测验证为正增益）---
                 if RERANK_MV_W and "mv_log_yi" in candidates.columns:
                     score += RERANK_MV_W * candidates["mv_log_yi"].rank(ascending=True)  # 小市值→靠前
@@ -482,8 +483,8 @@ def _backtest_single_mode(factor_data: pd.DataFrame, model, mode: str, top_n: in
         # 信号强度过滤：Top1预测收益率低于min_pred则空仓（弱信号胜率显著低，回测验证可提升夏普/降低回撤）
         if min_pred is not None and selected_preds:
             if selected_preds[0] < min_pred:
-                skipped_empty += 1
-                equity_points.append({"date": rebal_date, "equity": equity})
+                _mark_empty(rebal_date,
+                            f"弱信号空仓（二次排序后Top1 pred={selected_preds[0] * 100:.2f}%低于阈值{min_pred * 100:.2f}%）")
                 continue
         # 分段动态开盘止盈：按当日Top1 pred选tp（弱信号小赚快跑、强信号给上涨空间）
         tp_eff = take_profit
@@ -594,6 +595,7 @@ def _backtest_single_mode(factor_data: pd.DataFrame, model, mode: str, top_n: in
             })
 
         if not period_rets:
+            _mark_empty(rebal_date, "入选股无有效T+1成交价格（停牌/数据缺失）")
             continue
 
         # 加权收益
@@ -614,8 +616,25 @@ def _backtest_single_mode(factor_data: pd.DataFrame, model, mode: str, top_n: in
         })
         equity_points.append({"date": rebal_date, "equity": equity})
 
-    if skipped_empty > 0:
-        logger.info(f"市场择时空仓次数: {skipped_empty} (大盘低于20日均线5%以上，极端熊市)")
+    total_days = len(rebalance_dates)
+    open_days = len(trades)
+    logger.info("=" * 60)
+    logger.info(f"交易日合计: {total_days} 天 = 开仓 {open_days} 天 + 空仓 {len(empty_days)} 天")
+    if open_days + len(empty_days) != total_days:
+        logger.warning(
+            f"开仓+空仓({open_days + len(empty_days)})与交易日总数({total_days})不一致，存在未归类交易日，请检查")
+
+    # 空仓日逐行打印（日期 + 原因），按原因归组并统计天数；每个交易日都必须有开仓或空仓的交代
+    if empty_days:
+        from collections import defaultdict
+        groups = defaultdict(list)
+        for ed in empty_days:
+            groups[ed["reason"].split("（")[0]].append(ed)
+        logger.info(f"--- 空仓日明细（共 {len(empty_days)} 天，按原因分组）---")
+        for key, items in sorted(groups.items(), key=lambda kv: -len(kv[1])):
+            logger.info(f"[{key}] 共 {len(items)} 天")
+            for ed in items:
+                logger.info(f"    空仓 {pd.Timestamp(ed['date']):%Y-%m-%d}  {ed['reason']}")
     if skipped_filter > 0:
         logger.info(f"当天大阳线过滤累计剔除: {skipped_filter}只候选股")
 
@@ -624,22 +643,26 @@ def _backtest_single_mode(factor_data: pd.DataFrame, model, mode: str, top_n: in
         equity_df = pd.DataFrame([{"date": all_dates[0], "equity": 1.0}])
     equity_df["date"] = pd.to_datetime(equity_df["date"])
 
-    metrics = _calc_metrics(equity_df, trades)
+    metrics = _calc_metrics(equity_df, trades, rebalance_dates, empty_days)
     # 添加仓位比例信息
     metrics["weights"] = weights
     trades_df = pd.DataFrame(trades)
     stock_trades_df = pd.DataFrame(stock_trades)
+    empty_days_df = pd.DataFrame(empty_days)
 
-    return {"metrics": metrics, "trades": trades_df, "stock_trades": stock_trades_df, "equity_curve": equity_df}
+    return {"metrics": metrics, "trades": trades_df, "stock_trades": stock_trades_df,
+            "empty_days": empty_days_df, "equity_curve": equity_df}
 
 
-def _calc_metrics(equity_df: pd.DataFrame, trades: list) -> dict:
-    """计算回测指标（1天持仓，每天调仓）"""
+def _calc_metrics(equity_df: pd.DataFrame, trades: list, trading_dates=None, empty_days=None) -> dict:
+    """计算回测指标（1天持仓，每天调仓）。
+    trading_dates: 回测区间内全部交易日（用于补全0交易的空仓月/空仓年份）；
+    empty_days: 空仓日记录 [{"date","reason"}]，用于统计开仓/空仓天数。"""
     horizon = 1  # 1天持仓
-    if equity_df.empty or len(trades) == 0:
+    if equity_df.empty:
         return {"total_return": 0, "annual_return": 0, "sharpe": 0,
                 "max_drawdown": 0, "win_rate": 0, "profit_loss_ratio": 0,
-                "num_trades": 0}
+                "num_trades": 0, "yearly_returns": {}, "monthly_returns": {}}
 
     total_return = equity_df["equity"].iloc[-1] - 1
 
@@ -671,51 +694,74 @@ def _calc_metrics(equity_df: pd.DataFrame, trades: list) -> dict:
     avg_loss = abs(float(np.mean(losses))) if losses else 1e-8
     profit_loss_ratio = avg_win / avg_loss if avg_loss > 0 else 0
 
-    # 年度收益统计
-    yearly = {}
+    # 交易日历 / 开仓日 / 空仓日集合（全部归一化到日期）
+    open_dates = [pd.Timestamp(t["date"]).normalize() for t in trades]
+    empty_dates = [pd.Timestamp(e["date"]).normalize() for e in (empty_days or [])]
+    if trading_dates is not None:
+        cal_dates = pd.to_datetime(pd.Series(trading_dates)).dt.normalize().tolist()
+    else:
+        cal_dates = pd.to_datetime(equity_df["date"]).dt.normalize().tolist()
+    open_set, empty_set = set(open_dates), set(empty_dates)
+
+    # 年度收益统计（按交易日历覆盖每一年，即使某年0交易也列出；含开仓/空仓天数）
+    yearly_rets = {}
     for t in trades:
-        year = pd.Timestamp(t["date"]).year
-        if year not in yearly:
-            yearly[year] = []
-        yearly[year].append(t["return"])
+        yearly_rets.setdefault(pd.Timestamp(t["date"]).year, []).append(t["return"])
+    yearly_cal, yearly_open, yearly_empty = {}, {}, {}
+    for d in cal_dates:
+        yearly_cal[d.year] = yearly_cal.get(d.year, 0) + 1
+    for d in open_set:
+        yearly_open[d.year] = yearly_open.get(d.year, 0) + 1
+    for d in empty_set:
+        yearly_empty[d.year] = yearly_empty.get(d.year, 0) + 1
     yearly_returns = {}
-    for year in sorted(yearly.keys()):
-        year_rets = yearly[year]
+    for year in sorted(yearly_cal.keys()):
+        year_rets = yearly_rets.get(year, [])
         cum = 1.0
         for r in year_rets:
             cum *= (1 + r)
         yearly_returns[year] = {
             "return": round(cum - 1, 4),
             "trades": len(year_rets),
+            "open_days": yearly_open.get(year, 0),
+            "empty_days": yearly_empty.get(year, 0),
+            "total_days": yearly_cal.get(year, 0),
             "win_rate": round(sum(1 for r in year_rets if r > 0) / len(year_rets), 4) if year_rets else 0,
             "avg_return": round(float(np.mean(year_rets)), 6) if year_rets else 0,
         }
 
-    # 月度收益统计
-    monthly = {}
+    # 月度收益统计（按交易日历补全回测区间内每个月份，含0交易空仓月；含开仓/空仓天数）
+    monthly_rets = {}
     for t in trades:
         ts = pd.Timestamp(t["date"])
-        month_key = f"{ts.year}-{ts.month:02d}"
-        if month_key not in monthly:
-            monthly[month_key] = []
-        monthly[month_key].append(t["return"])
-    # 补全回测区间内所有月份（含 0 笔交易的空仓月），避免空仓月被漏报
+        monthly_rets.setdefault(f"{ts.year}-{ts.month:02d}", []).append(t["return"])
+    monthly_cal, monthly_open, monthly_empty = {}, {}, {}
+    for d in cal_dates:
+        mk = f"{d.year}-{d.month:02d}"
+        monthly_cal[mk] = monthly_cal.get(mk, 0) + 1
+    for d in open_set:
+        mk = f"{d.year}-{d.month:02d}"
+        monthly_open[mk] = monthly_open.get(mk, 0) + 1
+    for d in empty_set:
+        mk = f"{d.year}-{d.month:02d}"
+        monthly_empty[mk] = monthly_empty.get(mk, 0) + 1
     monthly_returns = {}
-    if "date" in equity_df.columns and len(equity_df) > 0:
-        m_start = pd.Timestamp(equity_df["date"].min()).to_period("M")
-        m_end = pd.Timestamp(equity_df["date"].max()).to_period("M")
-        all_months = pd.period_range(m_start, m_end, freq="M")
+    if cal_dates:
+        all_months = pd.period_range(min(cal_dates).to_period("M"), max(cal_dates).to_period("M"), freq="M")
     else:
-        all_months = [pd.Period(k) for k in sorted(monthly.keys())]
+        all_months = [pd.Period(k) for k in sorted(monthly_rets.keys())]
     for p in all_months:
         month_key = f"{p.year}-{p.month:02d}"
-        month_rets = monthly.get(month_key, [])
+        month_rets = monthly_rets.get(month_key, [])
         cum = 1.0
         for r in month_rets:
             cum *= (1 + r)
         monthly_returns[month_key] = {
             "return": round(cum - 1, 4),
             "trades": len(month_rets),
+            "open_days": monthly_open.get(month_key, 0),
+            "empty_days": monthly_empty.get(month_key, 0),
+            "total_days": monthly_cal.get(month_key, 0),
             "win_rate": round(sum(1 for r in month_rets if r > 0) / len(month_rets), 4) if month_rets else 0,
             "avg_return": round(float(np.mean(month_rets)), 6) if month_rets else 0,
         }
@@ -751,26 +797,31 @@ def _print_metrics(mode: str, m: dict, take_profit: float = 0.02, stop_loss: flo
     logger.info(f"    盈亏比:     {m['profit_loss_ratio']:.4f}")
     logger.info(f"    单次平均收益: {m.get('avg_return_per_trade', 0) * 100:.4f}%")
     logger.info(f"    交易次数:   {m['num_trades']}")
-    # 年度收益
+    # 年度收益（含开仓/空仓天数）
     yearly = m.get("yearly_returns", {})
     if yearly:
-        logger.info(f"    --- 年度收益 ---")
+        logger.info("    --- 年度收益（开仓/空仓天数）---")
         for year, ym in sorted(yearly.items()):
             logger.info(
-                f"    {year}年: 收益={ym['return'] * 100:+.2f}%, 交易{ym['trades']}次, 胜率={ym['win_rate'] * 100:.1f}%, 单次均收={ym['avg_return'] * 100:.4f}%")
+                f"    {year}年: 收益={ym['return'] * 100:+.2f}%, "
+                f"开仓{ym.get('open_days', ym['trades'])}天/空仓{ym.get('empty_days', 0)}天(共{ym.get('total_days', ym['trades'])}交易日), "
+                f"交易{ym['trades']}次, 胜率={ym['win_rate'] * 100:.1f}%, 单次均收={ym['avg_return'] * 100:.4f}%")
 
-    # 最新年度月度收益（含空仓月，0 笔交易也打印，避免缺月）
+    # 最新年度月度收益（每个月都打印，含 0 交易的纯空仓月及开仓/空仓天数）
     monthly = m.get("monthly_returns", {})
     latest_year = max((k.split("-")[0] for k in monthly.keys()), default=str(pd.Timestamp.now().year))
     monthly_latest = {k: v for k, v in monthly.items() if k.startswith(latest_year)}
     if monthly_latest:
-        logger.info(f"    --- {latest_year}年月度收益（空仓月也列出）---")
+        logger.info(f"    --- {latest_year}年月度收益（空仓月也列出，开仓/空仓天数）---")
         for month_key, mm in sorted(monthly_latest.items()):
             if mm["trades"] == 0:
-                logger.info(f"    {month_key}: 空仓（0笔交易，大盘择时或二次排序Top1 pred<min_pred，收益0%）")
+                logger.info(
+                    f"    {month_key}: 空仓月（开仓0天/空仓{mm.get('empty_days', 0)}天，共{mm.get('total_days', 0)}交易日，收益0%；逐日原因见上方空仓日明细）")
             else:
                 logger.info(
-                    f"    {month_key}: 收益={mm['return'] * 100:+.2f}%, 交易{mm['trades']}次, 胜率={mm['win_rate'] * 100:.1f}%, 单次均收={mm['avg_return'] * 100:.4f}%")
+                    f"    {month_key}: 收益={mm['return'] * 100:+.2f}%, "
+                    f"开仓{mm.get('open_days', mm['trades'])}天/空仓{mm.get('empty_days', 0)}天, "
+                    f"交易{mm['trades']}次, 胜率={mm['win_rate'] * 100:.1f}%, 单次均收={mm['avg_return'] * 100:.4f}%")
 
 
 def save_backtest_results(results: dict, tag: str = "latest"):
@@ -787,6 +838,8 @@ def save_backtest_results(results: dict, tag: str = "latest"):
         res["trades"].to_csv(out_dir / f"trades_{h}.csv", index=False, encoding="utf-8-sig")
         if "stock_trades" in res and not res["stock_trades"].empty:
             res["stock_trades"].to_csv(out_dir / f"stock_trades_{h}.csv", index=False, encoding="utf-8-sig")
+        if "empty_days" in res and not res["empty_days"].empty:
+            res["empty_days"].to_csv(out_dir / f"empty_days_{h}.csv", index=False, encoding="utf-8-sig")
         res["equity_curve"].to_csv(out_dir / f"equity_{h}.csv", index=False, encoding="utf-8-sig")
         # 年度收益
         for year, ym in m.get("yearly_returns", {}).items():

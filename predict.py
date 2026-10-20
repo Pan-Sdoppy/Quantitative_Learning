@@ -17,19 +17,18 @@ import json
 import sys
 import warnings
 from datetime import datetime, time
-from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
 from core.backtest_engine import (
-    KLINE_SHADOW_W, KLINE_KFLAG_W, KLINE_BODY_W, KLINE_HIGH20_W,
+    KLINE_SHADOW_W, KLINE_KFLAG_W,
     RERANK_MV_W, RERANK_VOL10_W, RERANK_MF_W,
 )
 from core.data_loader import load_all_data, get_stock_list, get_stock_industry
 from core.factors import compute_factors
 from core.model import EnsembleModel, compute_confidence
-from core.utils import RESULT_DIR, MODEL_DIR, get_logger, RAW_DIR
+from core.utils import RESULT_DIR, MODEL_DIR, get_logger
 
 warnings.filterwarnings("ignore")
 logger = get_logger("predict")
@@ -37,9 +36,6 @@ logger = get_logger("predict")
 PREDICT_TAG = "latest/predict"  # 预测自动加载预测模型（100%全量数据训练）
 TOP_N = 5000
 HORIZONS = ["1d_close"]
-INTRADAY_CACHE_FILE = Path(RAW_DIR) / "_intraday_last_update.json"
-INTRADAY_DATA_CACHE = Path(RAW_DIR) / "_intraday_cache.parquet"
-INTRADAY_MIN_INTERVAL = 0  # 盘中每次运行都获取最新实时数据，不缓存（0=不节流）
 MIN_STOCKS_PER_DAY = 1000  # 最新交易日最少股票数，避免盘中数据不完整
 MIN_PRED = 0.010  # 信号强度过滤：综合排序Top1预测次日收益<1.0%提示空仓（与 backtest_engine/train 守卫一致，2022起夏普最高阈值）
 # 分段动态开盘止盈（与backtest.py一致）：pred<1%开盘止盈1.5%、pred≥1%开盘止盈3%，盘中止盈4%
@@ -77,9 +73,8 @@ def _pad_str(s: str, width: int, align: str = "left") -> str:
         return " " * left + s + " " * right
 
 
-# 数字列（右对齐）和文字列（左对齐）的判断
+# 需要右对齐的数字列
 NUMERIC_COLS = {"收盘价", "最新涨跌幅"}
-TEXT_COLS = {"股票代码", "股票名称", "状态", "所属板块"}
 
 
 def _format_val(col: str, val) -> str:
@@ -152,66 +147,9 @@ def is_trading_hours(now: datetime) -> bool:
     return time(9, 30) <= t <= time(15, 0)
 
 
-def should_update_intraday(now: datetime) -> bool:
-    """距上次盘中更新是否已超过最小间隔（15分钟）"""
-    if not INTRADAY_CACHE_FILE.exists():
-        return True
-    try:
-        with open(INTRADAY_CACHE_FILE, "r", encoding="utf-8") as f:
-            last = json.load(f).get("last_update")
-        if not last:
-            return True
-        last_dt = datetime.fromisoformat(last)
-        elapsed = (now - last_dt).total_seconds() / 60
-        return elapsed >= INTRADAY_MIN_INTERVAL
-    except Exception:
-        return True
-
-
-def save_intraday_update_time(now: datetime):
-    """记录本次盘中数据更新时间"""
-    try:
-        with open(INTRADAY_CACHE_FILE, "w", encoding="utf-8") as f:
-            json.dump({"last_update": now.isoformat()}, f, ensure_ascii=False)
-    except Exception as e:
-        logger.warning(f"盘中更新时间保存失败: {e}")
-
-
-def load_intraday_cache(now: datetime):
-    """加载盘中实时数据缓存。
-    硬性规则：盘中只接受【今天】的缓存，绝不允许拿前一天/上周五的旧行情
-    冒充实时数据继续出预测（旧缓存只能在非交易时间走存量分支，不能用于盘中）。"""
-    if not INTRADAY_DATA_CACHE.exists() or not INTRADAY_CACHE_FILE.exists():
-        return None
-    try:
-        with open(INTRADAY_CACHE_FILE, "r", encoding="utf-8") as f:
-            last = json.load(f).get("last_update")
-        if not last:
-            return None
-        last_dt = datetime.fromisoformat(last)
-        if last_dt.date() != now.date():
-            logger.error(f"盘中缓存是 {last_dt:%Y-%m-%d %H:%M} 的旧数据（非今天），拒绝用于实时预测")
-            return None
-        df = pd.read_parquet(INTRADAY_DATA_CACHE)
-        if df is None or df.empty:
-            return None
-        return df
-    except Exception:
-        return None
-
-
-def save_intraday_cache(df: pd.DataFrame):
-    """缓存盘中实时数据"""
-    try:
-        df.to_parquet(INTRADAY_DATA_CACHE, index=False)
-    except Exception as e:
-        logger.warning(f"盘中数据缓存失败: {e}")
-
-
-def fetch_intraday_data() -> pd.DataFrame:
-    """用akshare新浪接口获取全市场实时行情，转换为与历史数据一致的格式"""
+def _fetch_one_spot() -> pd.DataFrame:
+    """单次抓取新浪全市场实时行情并清洗为标准格式（仅主板、close>0）。"""
     import akshare as ak
-    logger.info("获取盘中实时行情（新浪接口）...")
     spot = ak.stock_zh_a_spot()
     # 列名中文映射：代码、名称、最新价、涨跌幅、今开、最高、最低、成交量、成交额、换手率
     col_map = {}
@@ -247,18 +185,44 @@ def fetch_intraday_data() -> pd.DataFrame:
             spot[c] = pd.to_numeric(spot[c], errors="coerce")
     # 剔除无效数据（最新价为空或0）
     spot = spot[(spot["close"] > 0) & spot["close"].notna()]
-    # 合理性校验：主板正常 3000+ 只，返回行数过少说明接口抖动/返回错误页/数据截断，
-    # 直接抛异常，禁止拿残缺数据继续出预测
-    if len(spot) < 2000:
-        raise RuntimeError(f"实时行情仅返回 {len(spot)} 只主板股票（正常应3000+），疑似接口异常，拒绝使用")
-    logger.info(f"盘中实时行情获取完成: {len(spot)} 只主板股票")
     return spot.reset_index(drop=True)
+
+
+def fetch_intraday_data() -> pd.DataFrame:
+    """用akshare新浪接口获取全市场实时行情，转换为与历史数据一致的格式。
+
+    新浪接口按约70个板块分页抓取，单次调用常有板块超时漏抓（主板在2950~3115间波动，
+    且每次漏抓的票不同）。因此多轮抓取并按 code 取并集补全，避免单次截断漏股；
+    多轮并集后仍低于下限则抛异常，禁止拿残缺数据出预测。
+    """
+    logger.info("获取盘中实时行情（新浪接口，多轮并集补全）...")
+    MIN_BOARD = 2800  # 并集后主板下限，低于此判定接口异常
+    TARGET_BOARD = 3050  # 达到该数量即提前停抓（较全）
+    MAX_ROUNDS = 3
+    merged = pd.DataFrame()
+    for r in range(1, MAX_ROUNDS + 1):
+        try:
+            one = _fetch_one_spot()
+        except Exception as e:
+            logger.warning(f"第{r}轮实时行情抓取失败({type(e).__name__}: {e})，继续下一轮")
+            continue
+        # 并集：同一 code 后到覆盖先到（同一时刻附近价格差异可忽略）
+        merged = pd.concat([merged, one], ignore_index=True)
+        merged = merged.drop_duplicates(subset="code", keep="last")
+        logger.info(f"第{r}轮抓取主板 {len(one)} 只，累计并集 {len(merged)} 只")
+        if len(merged) >= TARGET_BOARD:
+            break
+    # 合理性校验：主板正常 3000+ 只，多轮并集仍过少说明接口抖动/错误页/截断，直接抛异常
+    if len(merged) < MIN_BOARD:
+        raise RuntimeError(f"实时行情多轮并集仅 {len(merged)} 只主板（正常应3000+），疑似接口异常，拒绝使用")
+    logger.info(f"盘中实时行情获取完成: {len(merged)} 只主板股票（多轮并集补全）")
+    return merged.reset_index(drop=True)
 
 
 def merge_intraday_data(historical: pd.DataFrame, intraday: pd.DataFrame) -> pd.DataFrame:
     """将盘中实时数据作为最新一个交易日合并到历史数据（替换当日已有记录）"""
     now = datetime.now()
-    # 盘中数据以15分钟为间隔向下取整，日期取当天
+    # 实时快照作为当天这一个交易日（盘中重复运行时以最新快照整体替换当日行）
     intraday = intraday.copy()
     intraday["date"] = pd.Timestamp(now.date())
     # 历史数据中剔除当天已有记录（盘中重复运行时用最新实时数据替换）
@@ -329,31 +293,17 @@ def main(pred_=["排名", "股票代码", "股票名称", "收盘价", "当天�
     use_intraday = is_trading_hours(now)
     intraday_df = None
     if use_intraday:
-        if should_update_intraday(now):
-            logger.info("Step 1: 交易时间内，更新盘中实时数据")
-            try:
-                intraday_df = fetch_intraday_data()
-                save_intraday_cache(intraday_df)
-                save_intraday_update_time(now)
-            except Exception as e:
-                logger.warning(f"盘中实时数据获取失败({e})，尝试使用今天的缓存")
-                intraday_df = load_intraday_cache(now)
-                if intraday_df is None:
-                    # 盘中跑预测就是为了看实时数据，没有今天的实时数据就直接停止，
-                    # 绝不允许降级到历史存量数据冒充实时（会误导实盘买入）
-                    logger.error("=" * 70)
-                    logger.error("盘中实时数据获取失败，且没有今天的盘中缓存：预测已停止。")
-                    logger.error("盘中预测必须基于当日实时行情，禁止用历史数据冒充，请稍后重试。")
-                    logger.error("=" * 70)
-                    sys.exit(1)
-        else:
-            logger.info("Step 1: 交易时间内，距上次更新不足15分钟，使用今天的缓存")
-            intraday_df = load_intraday_cache(now)
-            if intraday_df is None:
-                logger.error("=" * 70)
-                logger.error("盘中缓存无效（非今天或损坏）：预测已停止，请稍后重试。")
-                logger.error("=" * 70)
-                sys.exit(1)
+        # 铁律：盘中预测永远使用当前时刻的实时行情，什么时候运行就什么时候重新拉取，
+        # 没有任何时间间隔/节流，禁止复用任何缓存或旧快照；拉取失败直接退出，不降级到历史数据。
+        logger.info("Step 1: 交易时间内，每次运行强制拉取盘中实时数据（不复用缓存）")
+        try:
+            intraday_df = fetch_intraday_data()
+        except Exception as e:
+            logger.error("=" * 70)
+            logger.error(f"盘中实时数据获取失败({e})：预测已停止。")
+            logger.error("盘中预测必须基于当日实时行情，禁止复用缓存/历史数据冒充实时，请稍后重试。")
+            logger.error("=" * 70)
+            sys.exit(1)
     else:
         logger.info("Step 1: 非交易时间，使用训练文件的最新存量数据（不更新）")
 
@@ -570,25 +520,20 @@ def main(pred_=["排名", "股票代码", "股票名称", "收盘价", "当天�
         if "ret_3d" in candidates.columns:
             score -= w[4] * candidates["ret_3d"].rank(ascending=True)  # 3日动量强→靠前
         # K线形态（open/high/low 现已随 result 取齐；上影短/光头阳权重由常量单一来源）
-        if (KLINE_SHADOW_W or KLINE_KFLAG_W or KLINE_BODY_W or KLINE_HIGH20_W) and \
+        if (KLINE_SHADOW_W or KLINE_KFLAG_W) and \
                 {'open', 'high', 'low', 'close'}.issubset(candidates.columns):
             _eps = 1e-9
             _rng = (candidates['high'] - candidates['low']).clip(lower=_eps)
             _upper = (candidates['high'] - np.maximum(candidates['open'], candidates['close'])) / _rng
-            _body = (candidates['close'] - candidates['open']).abs() / _rng
             _bull = ((candidates['close'] >= candidates['high'] - 0.01 * _rng) & (
-                        candidates['close'] > candidates['open']))
+                    candidates['close'] > candidates['open']))
             _bear = ((candidates['close'] <= candidates['low'] + 0.01 * _rng) & (
-                        candidates['close'] < candidates['open']))
+                    candidates['close'] < candidates['open']))
             if KLINE_SHADOW_W:
                 score += KLINE_SHADOW_W * _upper.rank(ascending=True)  # 上影线短→rank小→靠前
             if KLINE_KFLAG_W:
                 _morph = _bull.astype(int) - _bear.astype(int)
                 score -= KLINE_KFLAG_W * _morph.rank(ascending=True)  # 光头阳→靠前；光头阴→靠后
-            if KLINE_BODY_W:
-                score -= KLINE_BODY_W * _body.rank(ascending=True)
-            if KLINE_HIGH20_W and 'ret_20d' in candidates.columns:
-                score += KLINE_HIGH20_W * candidates['ret_20d'].rank(ascending=True)
         # 规模/量能/资金流三因子（小值优先，各权重1，与回测一致）
         if RERANK_MV_W and "mv_log_yi" in candidates.columns:
             score += RERANK_MV_W * candidates["mv_log_yi"].rank(ascending=True)  # 小市值→靠前

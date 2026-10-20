@@ -26,7 +26,6 @@ socket.setdefaulttimeout(30)
 
 START_DATE = "20160101"
 MIN_LIST_DAYS = 60
-MAX_WORKERS = 5
 META_PATH = RAW_DIR / "_meta.json"
 
 _stats_lock = threading.Lock()
@@ -282,7 +281,6 @@ def _process_one_stock(code: str, name: str, start_date: str, today: str,
     更新后重跑自动全量重拉修复。
     """
     file_path = RAW_DIR / f"{code}.parquet"
-    today_ts = pd.Timestamp(today)
     retry_after_jump = False  # 衔接跳变转全量重拉的标志
 
     # 用元数据快速判断是否已最新
@@ -374,7 +372,7 @@ def _process_one_stock(code: str, name: str, start_date: str, today: str,
 
 
 def update_data(start_date: str = START_DATE, force_full: bool = False,
-                max_workers: int = MAX_WORKERS, is_intraday: bool = False) -> dict:
+                is_intraday: bool = False) -> dict:
     """增量更新全市场数据（baostock，单线程，稳定快速不依赖V8引擎）
     is_intraday=True时，强制重新下载今天的数据（盘中价格在变化）
     """
@@ -512,7 +510,6 @@ HS300_PATH = RAW_DIR / "_index_hs300.parquet"
 def update_hs300():
     """下载/更新沪深300指数日线数据（前复权）"""
     import akshare as ak
-    today = _get_today_str()
     try:
         df = ak.stock_zh_index_daily(symbol="sh000300")
         if df is None or df.empty:

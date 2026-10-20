@@ -112,7 +112,7 @@ def save_checkpoint(tag: str, cp: dict):
 
 
 def train_models_with_split(labeled, factor_cols, horizons, split_ratio=0.8, save_tag="",
-                            mode_name="", retrain=False, split_date=None, val_end=None):
+                            mode_name="", split_date=None, val_end=None):
     """用指定分割比例或固定日期训练一套模型，保存到save_tag目录
     split_date: 固定分割日期（如"2020-12-31"），优先于split_ratio
     val_end: 验证集截止特征日（含），None 时验证集=split_date之后全部数据。
@@ -141,10 +141,8 @@ def train_models_with_split(labeled, factor_cols, horizons, split_ratio=0.8, sav
     data_signature = f"{len(factor_cols)}f_{train_df['date'].max():%Y%m%d}_{len(train_df)}"
     train_end_date = train_end.strftime("%Y-%m-%d")
 
-    # 每次运行都重新训练，不清空断点文件（保留训练过程中的宕机恢复能力）
-    cp = load_checkpoint(save_tag)
-    trained_horizons = []  # 每次运行都从头训练，不跳过已训练模型
-    cp_data_sig = cp.get("data_signature", "")
+    # 每次运行都重新训练（断点文件仅记录本次训练进度，不从旧断点恢复，不跳过模型）
+    trained_horizons = []
 
     logger.info(f"开始训练，数据签名: {data_signature}")
     cp = {"data_signature": data_signature, "trained_horizons": [],
@@ -194,7 +192,7 @@ def train_models_with_split(labeled, factor_cols, horizons, split_ratio=0.8, sav
 
 
 def train_models_full_data(labeled, factor_cols, horizons, save_tag,
-                           fixed_iters, retrain=False, mode_name="预测模型"):
+                           fixed_iters, mode_name="预测模型"):
     """用给定样本全量训练一套模型（无验证集，固定迭代轮数）
     mode_name: 日志标识——"回测模型-阶段2refit"（<=2021）或"预测模型"（100%全量）
     fixed_iters: {horizon: {"lgb": int, "xgb": int, "mlp": int}} 各模型固定迭代次数
@@ -208,8 +206,7 @@ def train_models_full_data(labeled, factor_cols, horizons, save_tag,
     data_signature = f"{len(factor_cols)}f_{train_end:%Y%m%d}_{len(train_df)}_full"
     train_end_date = train_end.strftime("%Y-%m-%d")
 
-    # 每次运行都重新训练
-    cp = load_checkpoint(save_tag)
+    # 每次运行都重新训练（断点文件仅记录本次训练进度，不从旧断点恢复）
     trained_horizons = []
     logger.info(f"开始训练（{mode_name}，无验证集，固定迭代轮数），数据签名: {data_signature}")
     cp = {"data_signature": data_signature, "trained_horizons": [],
@@ -538,7 +535,7 @@ def main():
     stage1_models = train_models_with_split(
         labeled, factor_cols, HORIZONS_DEFAULT,
         split_date=STAGE1_TRAIN_END, val_end=STAGE1_VAL_END,
-        save_tag=BACKTEST_STAGE1_TAG, mode_name="回测模型-阶段1早停", retrain=False
+        save_tag=BACKTEST_STAGE1_TAG, mode_name="回测模型-阶段1早停"
     )
     best_iters = extract_best_iters(stage1_models, HORIZONS_DEFAULT)
     logger.info(f"阶段1早停确定的迭代轮数（阶段2与预测模型固定继承）: {best_iters}")
@@ -552,7 +549,7 @@ def main():
                 f"共 {len(bt_train)} 行")
     bt_models = train_models_full_data(
         bt_train, factor_cols, HORIZONS_DEFAULT,
-        save_tag=BACKTEST_CANDIDATE_TAG, fixed_iters=best_iters, retrain=False,
+        save_tag=BACKTEST_CANDIDATE_TAG, fixed_iters=best_iters,
         mode_name="回测模型-阶段2 refit"
     )
     del bt_train;
@@ -582,7 +579,7 @@ def main():
         "\n  4b. 预测模型 (100%全量数据 2016~最新 训练，迭代轮数继承阶段1早停，用于实盘选股；与回测模型是两套独立模型)")
     pred_models = train_models_full_data(
         labeled, factor_cols, HORIZONS_DEFAULT,
-        save_tag=PREDICT_TAG, fixed_iters=best_iters, retrain=False,
+        save_tag=PREDICT_TAG, fixed_iters=best_iters,
         mode_name="预测模型-100%全量"
     )
 
@@ -594,9 +591,9 @@ def main():
     logger.info(f"回测模型路径: {MODEL_DIR / BACKTEST_TAG}")
     logger.info(f"预测模型路径: {MODEL_DIR / PREDICT_TAG}")
     if bt_success:
-        logger.info(f"可运行 python backtest.py 进行回测（自动加载回测模型，动态卖出策略）")
+        logger.info("可运行 python backtest.py 进行回测（自动加载回测模型，动态卖出策略）")
     if pred_success:
-        logger.info(f"可运行 python predict.py 进行预测（自动加载预测模型）")
+        logger.info("可运行 python predict.py 进行预测（自动加载预测模型）")
 
 
 if __name__ == "__main__":

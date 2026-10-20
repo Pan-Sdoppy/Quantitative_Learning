@@ -142,8 +142,6 @@ class LGBModel:
             self.horizon = meta.get("horizon", self.horizon)
         return self
 
-        return self
-
 
 # ============================================================
 # XGBoost 模型
