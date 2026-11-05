@@ -36,6 +36,41 @@ def _get_today_str() -> str:
     return datetime.now().strftime("%Y%m%d")
 
 
+def _bs_login(max_retries: int = 8, wait_sec: int = 8):
+    """baostock 登录（带重试）。
+
+    免费服务端在晚间/高峰常出现网络超时（timed out）、服务器连接失败、
+    接收数据异常（error_code 10002007）等，单次登录成功率不稳定（实测约1/4）。
+    每次失败先清理可能残留的坏 socket，再等待后重试；全部失败才抛错。
+    返回已登录的 baostock 模块（调用方结束后仍需 bs.logout()）。
+    """
+    import baostock as bs
+    lg = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            lg = bs.login()
+        except Exception as e:
+            logger.warning(f"baostock 登录异常(第{attempt}/{max_retries}次): {e}")
+            lg = None
+        if lg is not None and getattr(lg, "error_code", "1") == "0":
+            if attempt > 1:
+                logger.info(f"baostock 第{attempt}次尝试登录成功")
+            return bs
+        msg = getattr(lg, "error_msg", "未知错误")
+        logger.warning(f"baostock 登录失败(第{attempt}/{max_retries}次): {msg}，{wait_sec}s后重试")
+        # 失败后 socket 可能处于坏状态（WinError 10057），先清理再重试
+        try:
+            bs.logout()
+        except Exception:
+            pass
+        if attempt < max_retries:
+            time.sleep(wait_sec)
+    raise RuntimeError(
+        f"baostock 连续{max_retries}次登录失败（多为免费服务端网络拥塞，非本程序问题），"
+        f"请稍等几分钟后重试 train.py --data-only"
+    )
+
+
 def get_expected_latest_trading_day(now: datetime = None) -> datetime:
     """获取预期的最新交易日（已收盘的最近一个交易日）
     - 周一到周五 15:00后：今天
@@ -166,11 +201,11 @@ def get_stock_industry(refresh: bool = False) -> pd.DataFrame:
         logger.info(f"从缓存加载股票行业分类，共 {len(df)} 只")
         return df
 
-    import baostock as bs
     logger.info("正在获取A股股票行业分类（baostock）...")
-    lg = bs.login()
-    if lg.error_code != "0":
-        logger.warning(f"baostock登录失败: {lg.error_msg}，返回空行业表")
+    try:
+        bs = _bs_login()
+    except RuntimeError as e:
+        logger.warning(f"{e}，返回空行业表")
         return pd.DataFrame(columns=["code", "name", "industry"])
     try:
         rs = bs.query_stock_industry()
@@ -338,6 +373,14 @@ def _process_one_stock(code: str, name: str, start_date: str, today: str,
             combined = pd.concat([existing, new_data], ignore_index=True)
             combined = combined.drop_duplicates(subset=["date"], keep="last")
             combined = combined.sort_values("date").reset_index(drop=True)
+            # 修复增量窗口把历史行 pct_chg 打成 NaN 的 bug：
+            # new_data 只拉最近3个日历日，_download_single 内部用 close.pct_change() 算 pct_chg，
+            # 短窗口首行恒为 NaN；keep="last" 合并后该 NaN 会写回被覆盖的历史重叠行
+            # （实测 2026-10-22 增量时 new_data 首行=10-20，次日起窗口后移不再覆盖，
+            #   导致 2026-10-20 单日 3052 只 pct_chg 永久为空）。
+            # 口径本就是 close.pct_change()*100（见本文件 _download_single），合并后整列重算：
+            # 不改变任何已有正确值，只补被窗口首行打 NaN 的历史行。
+            combined["pct_chg"] = combined["close"].pct_change() * 100
             combined.to_parquet(file_path, index=False)
             _update_meta(code, combined["date"].max().strftime("%Y-%m-%d"), meta)
             with _stats_lock:
@@ -376,12 +419,8 @@ def update_data(start_date: str = START_DATE, force_full: bool = False,
     """增量更新全市场数据（baostock，单线程，稳定快速不依赖V8引擎）
     is_intraday=True时，强制重新下载今天的数据（盘中价格在变化）
     """
-    import baostock as bs
-    # baostock登录（全局只需一次）
-    lg = bs.login()
-    if lg.error_code != "0":
-        logger.error(f"baostock登录失败: {lg.error_msg}")
-        raise RuntimeError(f"baostock登录失败: {lg.error_msg}")
+    # baostock登录（全局只需一次；免费服务端晚间易超时，带重试）
+    bs = _bs_login()
     logger.info("baostock登录成功")
 
     today = _get_today_str()

@@ -503,9 +503,9 @@ def main():
 
     if factor_data is None:
         start_dt = f"{START_DATE[:4]}-{START_DATE[4:6]}-{START_DATE[6:]}"
-        all_data = load_all_data(start_date=start_dt)
-        factor_data, factor_cols = compute_factors(all_data, redundancy_cutoff=REDUNDANCY_CUTOFF)
-        del all_data
+        # all_data 不保留外部引用，进 compute_factors 后由其内部负责释放，避免 concat 时双份驻留
+        factor_data, factor_cols = compute_factors(load_all_data(start_date=start_dt),
+                                                   redundancy_cutoff=REDUNDANCY_CUTOFF)
         import gc;
         gc.collect()
         factor_data.to_parquet(factor_path, index=False)

@@ -32,11 +32,19 @@ KLINE_KFLAG_W = 0.5  # 光头阳加分/光头阴减分权重（半权重，全�
 RERANK_MV_W = 1.0  # 流通市值对数 mv_log_yi（小市值次日溢价显著）
 RERANK_VOL10_W = 1.0  # 10日量比 vol_ratio_10（缩量企稳，比5日量比更稳）
 RERANK_MF_W = 1.0  # 日内资金流 mf_intraday（收盘位置×成交额，规避高位放量收盘）
+# === VWAP 贴近度因子（2022起样本外回测验证为正增益：rank=0.5不过滤，累计+13.4%/夏普13.57→13.70/回撤不变）===
+# 原理：|close/vwap-1|越小=全天均衡尾盘不偷袭，次日胜率高；硬过滤急拉票会砍掉次日续涨股，得不偿失
+VWAP_RERANK_W = 0.5  # |close/vwap-1|越小越靠前
+VWAP_FILTER_MAX = None  # 不做硬过滤（过滤>1.5%会导致回撤翻倍，已验证为负向）
 
 # === 板块涨停集中度因子（实验开关，默认0=关闭）===
 # 候选股所属板块当天涨停数量越多→越靠前（涨停集中板块强势，其所属可买个股次日有望补涨）
 # 需行业归属表 data/raw/_stock_industry.csv，仅当权重>0时才加载行业并计算
 SECTOR_LIMITUP_W = float(os.environ.get("SECTOR_LIMITUP_W", "0"))
+
+# === 置信度权重（实验开关，默认0=关闭）===
+# 二次排序 Top10 里，置信度（pred 横截面排名百分位）越高越靠前
+CONFIDENCE_RERANK_W = float(os.environ.get("CONFIDENCE_RERANK_W", "0"))
 
 logger = get_logger("backtest")
 
@@ -71,7 +79,9 @@ def run_backtest(factor_data: pd.DataFrame, models: dict,
                  rerank_weights: list = None,
                  min_pred: float = None,
                  index_5d_empty: float = None,
-                 dynamic_tp: tuple = None) -> dict:
+                 dynamic_tp: tuple = None,
+                 empty_fallback: str = None,
+                 buy_predmax_only: bool = False) -> dict:
     """运行动态卖出回测（1d_close）
     take_profit: 高开止盈阈值（如0.02=高开2%开盘卖），None=无止盈
     stop_loss: 止损阈值（如-0.02=跌2%止损），None=不止损
@@ -170,7 +180,9 @@ def run_backtest(factor_data: pd.DataFrame, models: dict,
                                     rerank_weights,
                                     min_pred,
                                     index_5d_empty,
-                                    dynamic_tp)
+                                    dynamic_tp,
+                                    empty_fallback,
+                                    buy_predmax_only)
         results[h] = res
         _print_metrics(h, res["metrics"], take_profit, stop_loss)
 
@@ -199,7 +211,9 @@ def _backtest_single_mode(factor_data: pd.DataFrame, model, mode: str, top_n: in
                           rerank_weights: list = None,
                           min_pred: float = None,
                           index_5d_empty: float = None,
-                          dynamic_tp: tuple = None) -> dict:
+                          dynamic_tp: tuple = None,
+                          empty_fallback: str = None,
+                          buy_predmax_only: bool = False) -> dict:
     """单模式回测（1d_close 动态止盈+止损）
     take_profit: 高开止盈阈值（如0.02=高开2%开盘卖），None=无止盈
     stop_loss: 止损阈值（如-0.02=跌2%止损），None=不止损
@@ -220,6 +234,11 @@ def _backtest_single_mode(factor_data: pd.DataFrame, model, mode: str, top_n: in
     rerank_method: 二次排序方式 amplitude_asc/vol_ratio_asc/gap_desc/composite
     rerank_weights: composite基础5因子权重 [振幅,5日量比,跳空,5日位置,3日动量]，None=[2,2,1,1,1]；
                     另有K线形态(KLINE_SHADOW/KFLAG)与规模/量能/资金流3因子(RERANK_MV/VOL10/MF)由常量控制
+    empty_fallback: 实验开关（默认None不改生产行为）。二次排序Top1弱信号空仓时，
+                    "cand"=改买二次排序候选池内pred最高且≥min_pred的股票；
+                    "market"=改买过滤后全市场pred最高且≥min_pred的股票；无达标股仍空仓
+    buy_predmax_only: 实验开关（默认False不改生产行为）。True时不再看二次排序Top1，
+                    直接判定过滤后全市场pred最高的可买入股票：pred≥min_pred则买入该股，否则空仓
     """
     feature_cols = [c for c in (model.feature_names or []) if c is not None and c in factor_data.columns]
     if not feature_cols:
@@ -408,6 +427,12 @@ def _backtest_single_mode(factor_data: pd.DataFrame, model, mode: str, top_n: in
             if len(day_data) < before:
                 logger.debug(f"  {rebal_date:%Y-%m-%d}: 量比过滤剔除{before - len(day_data)}只")
 
+        # VWAP尾盘急拉过滤（实验开关）：收盘远高于当日均价=尾盘偷袭/出货，次日易低开
+        if VWAP_FILTER_MAX is not None and "close_vs_vwap" in day_data.columns:
+            before = len(day_data)
+            day_data = day_data[day_data["close_vs_vwap"] <= VWAP_FILTER_MAX]
+            skipped_filter += before - len(day_data)
+
         # 剔除T日上影线异常股（冲高回落，上方抛压重）
         if filter_upper_shadow is not None and "high_low_ratio" in day_data.columns:
             before = len(day_data)
@@ -471,21 +496,66 @@ def _backtest_single_mode(factor_data: pd.DataFrame, model, mode: str, top_n: in
                     score += RERANK_VOL10_W * candidates["vol_ratio_10"].rank(ascending=True)  # 10日缩量→靠前
                 if RERANK_MF_W and "mf_intraday" in candidates.columns:
                     score += RERANK_MF_W * candidates["mf_intraday"].rank(ascending=True)  # 低位收盘/非放量→靠前
+                # VWAP贴近度（实验开关）：|close/vwap-1|越小=全天均衡→越靠前
+                if VWAP_RERANK_W and "close_vs_vwap" in candidates.columns:
+                    _vwap_dist = candidates["close_vs_vwap"].abs()
+                    score += VWAP_RERANK_W * _vwap_dist.rank(ascending=True)
                 # === 板块涨停集中度因子（实验开关，默认关闭；涨停集中板块强势，其所属可买个股高优先）===
                 if SECTOR_LIMITUP_W > 0 and "sector_limitup_cnt" in candidates.columns:
                     score -= SECTOR_LIMITUP_W * candidates["sector_limitup_cnt"].rank(ascending=True)
+                # === 置信度因子（实验开关，默认关闭；置信度高=pred排名靠前，Top10里优先选pred最高的）===
+                if CONFIDENCE_RERANK_W > 0 and "confidence" in candidates.columns:
+                    score -= CONFIDENCE_RERANK_W * candidates["confidence"].rank(ascending=True)
                 candidates = candidates.assign(_rerank_score=score).sort_values("_rerank_score")
             selected = candidates.head(top_n)
         else:
             selected = day_data.nlargest(top_n, "pred")
+
         selected_codes = selected["code"].tolist()
         selected_preds = selected["pred"].tolist()
         # 信号强度过滤：Top1预测收益率低于min_pred则空仓（弱信号胜率显著低，回测验证可提升夏普/降低回撤）
-        if min_pred is not None and selected_preds:
-            if selected_preds[0] < min_pred:
+        # ---- 实验开关 buy_predmax_only：不看二次排序Top1，直接判定"过滤后全市场pred最高的可买入股票" ----
+        # pred≥min_pred → 买入该股；否则空仓（默认False=生产行为不变）
+        if buy_predmax_only and min_pred is not None and len(day_data) > 0:
+            _best = day_data.nlargest(1, "pred")
+            if _best["pred"].iloc[0] >= min_pred:
+                selected = _best
+                selected_preds = selected["pred"].tolist()
+                logger.debug(
+                    f"  {rebal_date:%Y-%m-%d}: buy_predmax_only 买入全市场pred最高 {selected['code'].iloc[0]} pred={selected_preds[0] * 100:.2f}%")
+            else:
                 _mark_empty(rebal_date,
-                            f"弱信号空仓（二次排序后Top1 pred={selected_preds[0] * 100:.2f}%低于阈值{min_pred * 100:.2f}%）")
+                            f"弱信号空仓（全市场pred最高可买入股 pred={_best['pred'].iloc[0] * 100:.2f}%低于阈值{min_pred * 100:.2f}%）")
                 continue
+        elif min_pred is not None and selected_preds:
+            if selected_preds[0] < min_pred:
+                # ---- 实验开关 empty_fallback：弱信号空仓日回退买入"pred最高的可买入股票" ----
+                # "cand"=二次排序候选池内pred最高；"market"=过滤后全市场pred最高（默认None=生产行为不变）
+                if empty_fallback in ("cand", "market"):
+                    _pool = candidates if (empty_fallback == "cand" and rerank_candidates is not None) else day_data
+                    if len(_pool) > 0:
+                        _best = _pool.nlargest(1, "pred")
+                        if _best["pred"].iloc[0] >= min_pred:
+                            selected = _best
+                            selected_preds = selected["pred"].tolist()
+                            logger.debug(
+                                f"  {rebal_date:%Y-%m-%d}: empty_fallback={empty_fallback} 弱信号回退买入pred最高 "
+                                f"{selected['code'].iloc[0]} pred={selected_preds[0] * 100:.2f}%")
+                        else:
+                            _mark_empty(rebal_date,
+                                        f"弱信号空仓（二次排序后Top1 pred={selected_preds[0] * 100:.2f}%低于阈值{min_pred * 100:.2f}%，"
+                                        f"且pred最高可买入股{_best['code'].iloc[0]} pred={_best['pred'].iloc[0] * 100:.2f}%也未达阈值）")
+                            continue
+                    else:
+                        _mark_empty(rebal_date,
+                                    f"弱信号空仓（二次排序后Top1 pred={selected_preds[0] * 100:.2f}%低于阈值{min_pred * 100:.2f}%，"
+                                    f"且无可买入股票）")
+                        continue
+                else:
+                    _mark_empty(rebal_date,
+                                f"弱信号空仓（二次排序后Top1 pred={selected_preds[0] * 100:.2f}%低于阈值{min_pred * 100:.2f}%）")
+                    continue
+
         # 分段动态开盘止盈：按当日Top1 pred选tp（弱信号小赚快跑、强信号给上涨空间）
         tp_eff = take_profit
         if dynamic_tp is not None and selected_preds:
@@ -624,17 +694,17 @@ def _backtest_single_mode(factor_data: pd.DataFrame, model, mode: str, top_n: in
         logger.warning(
             f"开仓+空仓({open_days + len(empty_days)})与交易日总数({total_days})不一致，存在未归类交易日，请检查")
 
-    # 空仓日逐行打印（日期 + 原因），按原因归组并统计天数；每个交易日都必须有开仓或空仓的交代
+    # 空仓日按原因归组统计：INFO 仅输出分组计数；逐条日期+原因走 DEBUG，明细另存 empty_days csv
     if empty_days:
         from collections import defaultdict
         groups = defaultdict(list)
         for ed in empty_days:
             groups[ed["reason"].split("（")[0]].append(ed)
-        logger.info(f"--- 空仓日明细（共 {len(empty_days)} 天，按原因分组）---")
+        logger.info(f"--- 空仓日按原因分组（共 {len(empty_days)} 天）---")
         for key, items in sorted(groups.items(), key=lambda kv: -len(kv[1])):
             logger.info(f"[{key}] 共 {len(items)} 天")
             for ed in items:
-                logger.info(f"    空仓 {pd.Timestamp(ed['date']):%Y-%m-%d}  {ed['reason']}")
+                logger.debug(f"    空仓 {pd.Timestamp(ed['date']):%Y-%m-%d}  {ed['reason']}")
     if skipped_filter > 0:
         logger.info(f"当天大阳线过滤累计剔除: {skipped_filter}只候选股")
 
@@ -816,7 +886,7 @@ def _print_metrics(mode: str, m: dict, take_profit: float = 0.02, stop_loss: flo
         for month_key, mm in sorted(monthly_latest.items()):
             if mm["trades"] == 0:
                 logger.info(
-                    f"    {month_key}: 空仓月（开仓0天/空仓{mm.get('empty_days', 0)}天，共{mm.get('total_days', 0)}交易日，收益0%；逐日原因见上方空仓日明细）")
+                    f"    {month_key}: 空仓月（开仓0天/空仓{mm.get('empty_days', 0)}天，共{mm.get('total_days', 0)}交易日，收益0%；逐日原因见 empty_days 结果 csv）")
             else:
                 logger.info(
                     f"    {month_key}: 收益={mm['return'] * 100:+.2f}%, "

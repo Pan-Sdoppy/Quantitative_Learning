@@ -24,6 +24,7 @@ import pandas as pd
 from core.backtest_engine import (
     KLINE_SHADOW_W, KLINE_KFLAG_W,
     RERANK_MV_W, RERANK_VOL10_W, RERANK_MF_W,
+    VWAP_RERANK_W,
 )
 from core.data_loader import load_all_data, get_stock_list, get_stock_industry
 from core.factors import compute_factors
@@ -322,6 +323,21 @@ def main(pred_=["排名", "股票代码", "股票名称", "收盘价", "当天�
         logger.info(f"本次预测基于存量数据: {all_data['date'].min():%Y-%m-%d} ~ {all_data['date'].max():%Y-%m-%d}")
 
     factor_data, factor_cols = compute_factors(all_data, skip_redundancy=True)
+
+    # 补 close_vs_vwap（vwap 贴近度二次排序因子，与回测引擎对齐；|close/vwap-1|越小越靠前）
+    # 必须在 del all_data 之前提取（all_data 含 amount/volume，compute_factors 会丢弃）
+    vwap_map = None
+    if "amount" in all_data.columns and VWAP_RERANK_W:
+        try:
+            _raw_latest = all_data.groupby("code", sort=False).tail(1)[["code", "close", "amount", "volume"]].copy()
+            _raw_latest["code"] = _raw_latest["code"].astype(str).str.zfill(6)
+            _raw_latest["_vwap"] = _raw_latest["amount"] / _raw_latest["volume"].replace(0, np.nan)
+            _raw_latest["close_vs_vwap"] = _raw_latest["close"] / _raw_latest["_vwap"] - 1
+            vwap_map = dict(zip(_raw_latest["code"], _raw_latest["close_vs_vwap"]))
+            logger.info(f"vwap贴近度因子已提取: {len(vwap_map)} 只")
+        except Exception as _e:
+            logger.warning(f"提取 close_vs_vwap 失败({_e})，本次排序不含 vwap 因子")
+
     del all_data
     import gc
     gc.collect()
@@ -334,6 +350,12 @@ def main(pred_=["排名", "股票代码", "股票名称", "收盘价", "当天�
         return
     latest_date = valid_days.max()
     latest_data = factor_data[factor_data["date"] == latest_date].copy()
+
+    # 用提前提取的 vwap_map 给 latest_data 补 close_vs_vwap 列
+    if vwap_map:
+        latest_data["code"] = latest_data["code"].astype(str).str.zfill(6)
+        latest_data["close_vs_vwap"] = latest_data["code"].map(vwap_map)
+        logger.info(f"vwap贴近度因子已挂上: 有效 {int(latest_data['close_vs_vwap'].notna().sum())}/{len(latest_data)} 只")
 
     # 股票池过滤：只保留主板可买列表内股票，剔除已退市/ST残留等池外异常票（在预测前过滤，保证 pred 与行情同序）
     try:
@@ -500,7 +522,7 @@ def main(pred_=["排名", "股票代码", "股票名称", "收盘价", "当天�
     # ========== 综合排序Top10（模型粗筛Top10→composite二次排序，口径与 backtest_engine 完全一致） ==========
     try:
         buyable = result[~result["is_limit_up"]].copy()
-        buyable = buyable[buyable["latest_pct_chg"] <= 0.090]  # 涨幅过滤：无下限，上限9.0%（避免追高，与回测一致）
+        buyable = buyable[buyable["latest_pct_chg"] <= 0.090]  # 涨幅过滤：无下限，上限9.0%（11档扫描年化收益率最高，与回测一致）
         pred_col = f"pred_ret_{available_horizons[0]}"
         # 粗筛：按 pred 选 Top10 候选（与回测 nlargest(pred) 口径一致；置信度是pred的单调映射，集合相同）
         candidates = buyable.nlargest(10, pred_col).copy()
@@ -541,9 +563,12 @@ def main(pred_=["排名", "股票代码", "股票名称", "收盘价", "当天�
             score += RERANK_VOL10_W * candidates["vol_ratio_10"].rank(ascending=True)  # 10日缩量→靠前
         if RERANK_MF_W and "mf_intraday" in candidates.columns:
             score += RERANK_MF_W * candidates["mf_intraday"].rank(ascending=True)  # 低位收盘/非放量→靠前
+        # vwap 贴近度（|close/vwap-1|越小越靠前=全天均衡尾盘不偷袭，与回测引擎对齐）
+        if VWAP_RERANK_W and "close_vs_vwap" in candidates.columns:
+            score += VWAP_RERANK_W * candidates["close_vs_vwap"].abs().rank(ascending=True)
         candidates["综合排序分"] = score
         candidates = candidates.sort_values("综合排序分")
-        rerank_desc = "composite二次排序（5基础因子+K线形态+规模/量能/资金流）"
+        rerank_desc = "composite二次排序（5基础因子+K线形态+规模/量能/资金流+vwap贴近度）"
         rerank_display = candidates[["code", "name", "close", "latest_pct_chg", "pred", "industry"]].copy()
         rerank_display.insert(0, "排名", range(1, len(rerank_display) + 1))
         rerank_display.columns = pred_

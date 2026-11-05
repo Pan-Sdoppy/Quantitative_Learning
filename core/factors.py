@@ -213,6 +213,10 @@ def compute_factors(all_data: pd.DataFrame, skip_redundancy: bool = False,
         del chunk_parts
         gc.collect()
 
+    # 原始 all_data 已不再需要，立刻释放后再做最终 concat，避免峰值打满
+    del all_data, codes
+    gc.collect()
+
     if not result_parts:
         raise RuntimeError("因子计算失败，无有效数据")
 

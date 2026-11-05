@@ -1,6 +1,6 @@
-/data/
-/logs/
-/models/
-/results/
+data/
+logs/
+models/
+results/
 /.idea
 *.pyc
